@@ -126,7 +126,8 @@ single source of truth.
 
 ```bash
 cd path/to/this/checkout
-uv run --python 3.11 --with pytest --with 'pillow==12.3.0' --with pyyaml python -m pytest tests/ -q   # offline
+# offline
+uv run --python 3.11 --with pytest --with 'pillow==12.3.0' --with pyyaml python -m pytest tests/ -q
 ```
 
 Never `pip install` anything into the Hermes venv (its pins are load-bearing); `uv run` builds a
