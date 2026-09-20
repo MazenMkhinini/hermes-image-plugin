@@ -325,6 +325,11 @@ def test_forced_png_fallback_is_noted(tmp_path):
         assert im.format == "PNG"
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows ignores the read-only attribute on a directory, so a directory that refuses "
+           "file creation cannot be constructed there",
+)
 def test_read_only_directory_error_names_the_directory(tmp_path):
     src = helpers.make_photo(tmp_path / "p.jpg", size=(80, 60))
     locked = tmp_path / "locked"

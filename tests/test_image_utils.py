@@ -414,7 +414,12 @@ def test_in_place_needs_both_flags_and_preserves_mode(tmp_path):
     assert done["replaced"] is True
     with Image.open(src) as im:
         assert im.size == (50, 50)
-    assert stat.S_IMODE(os.stat(src).st_mode) == 0o640   # permissions preserved
+    # Windows chmod only toggles the read-only bit, so an exact POSIX mode cannot be asserted
+    # there: check the bit that Windows actually models, and the exact mode everywhere else.
+    if os.name == "nt":
+        assert stat.S_IMODE(os.stat(src).st_mode) & stat.S_IWRITE, "file was left read-only"
+    else:
+        assert stat.S_IMODE(os.stat(src).st_mode) == 0o640   # permissions preserved
     no_temps(tmp_path)
 
 
