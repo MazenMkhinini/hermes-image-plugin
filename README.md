@@ -1,5 +1,10 @@
 # Hermes `image-utils` plugin
 
+## AI-generated code
+
+The code in this repository was written with AI assistance, then reviewed and tested before
+publication.
+
 Local image-file tools for Hermes Agent: inspect, resize, crop, rotate, convert and re-encode photos
 without a shell. Pillow (12.3.0, already in the Hermes venv) runs in-process — no `subprocess`, no
 ImageMagick, no network, no new dependencies.
@@ -11,11 +16,6 @@ tables below.
 dependency rather than something this plugin installs, so it is deliberately *not* declared in
 `plugin.yaml` (no `python_dependencies` key). Without it, `image_info` still answers and reports
 `pillow_available: false`, while the other five tools refuse with a `how_to_fix`.
-
-## AI-generated code
-
-The code in this repository was written with AI assistance, then reviewed and tested before
-publication.
 
 ## What it gives the agent
 
