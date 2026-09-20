@@ -1,11 +1,11 @@
 """Fixture factory for the image-utils test suite.
 
 All fixtures are generated with Pillow itself — no piexif (not installed), no binary blobs in the
-repo. Two traps this module guards against, both found during the plan review:
+repo. Two things this module guards against:
 
 - ``Image.new("P", size, <int index>)`` frames saved with ``save_all=True`` silently produce a
   ONE-frame GIF. ``make_animated_gif`` builds RGB frames and converts to P, then asserts the result
-  really is animated (review S-12).
+  really is animated.
 - EXIF orientation must be written with ``Image.Exif()`` and reloaded to confirm it survived.
 """
 
@@ -91,14 +91,14 @@ def make_animated_gif(path: Path, frames: int = 3, size: Tuple[int, int] = (40, 
     frames_p[0].save(path, save_all=True, append_images=frames_p[1:], duration=duration, loop=0)
     for frame in frames_p:
         frame.close()
-    with Image.open(path) as check:   # never let a one-frame GIF pass as an animation (S-12)
+    with Image.open(path) as check:   # never let a one-frame GIF pass as an animation
         if getattr(check, "n_frames", 1) != frames:
             raise AssertionError(f"fixture is not animated: n_frames={getattr(check, 'n_frames', 1)}")
     return path
 
 
 def make_png_header_only(path: Path, width: int, height: int, color_type: int = 2) -> Path:
-    """A small PNG whose IHDR declares huge dimensions — the decompression-bomb shape (S-1).
+    """A small PNG whose IHDR declares huge dimensions — the decompression-bomb shape.
 
     Built by patching a real 1x1 PNG's IHDR (with a recomputed CRC) so the file keeps a valid PNG
     structure while declaring the requested pixel count.
@@ -124,7 +124,7 @@ def truncate(path: Path, fraction: float = 0.5) -> Path:
 
 
 def make_noise_jpeg(path: Path, size: Tuple[int, int] = (900, 700), quality: int = 90) -> Path:
-    """Noise, so encoder knobs visibly change the output size (flat colour does not, review P-6)."""
+    """Noise, so encoder knobs visibly change the output size (flat colour does not)."""
     import random
 
     rng = random.Random(1234)

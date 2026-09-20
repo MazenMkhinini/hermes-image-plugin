@@ -4,8 +4,8 @@
 # Single source of truth: this checkout. Each profile gets a SYMLINK to it, so an edit here is live
 # in every profile (no copy drift) and rollback is one `rm` plus a gateway restart.
 #
-# No secrets and no config: the plugin has no settings and needs no key. (Contrast the grocy plugin,
-# whose install.sh also writes plugins.entries.grocy.settings and needs GROCY_API_KEY in .env.)
+# No secrets and no config: the plugin has no settings, no config keys and needs no key — enabling it
+# in plugins.enabled is the whole installation.
 #
 # Usage:
 #   ./install.sh                      # every profile of this Hermes root, staged (default last)

@@ -2,7 +2,7 @@
 
 Local image-file tools for Hermes Agent: inspect, resize, crop, rotate, convert and re-encode photos
 without a shell. Pillow (12.3.0, already in the Hermes venv) runs in-process — no `subprocess`, no
-ImageMagick, no network, no new dependencies, and no Grocy or other household service is touched.
+ImageMagick, no network, no new dependencies.
 Toolset `image_utils`, six tools, no config and no secrets. The authoritative tool list is
 `provides_tools` in `plugin.yaml`; the test suite pins it against the schemas, the handlers, and the
 tables below.
@@ -11,10 +11,6 @@ tables below.
 dependency rather than something this plugin installs, so it is deliberately *not* declared in
 `plugin.yaml` (no `python_dependencies` key). Without it, `image_info` still answers and reports
 `pillow_available: false`, while the other five tools refuse with a `how_to_fix`.
-
-Built 2026-09-17 through design review → implementation → adversarial review → fixes; the decisions
-that came out of it are recorded in **Safety behaviour that matters** and **Decisions and known
-limits** below.
 
 ## What it gives the agent
 
@@ -64,11 +60,10 @@ the envelope describes the bytes that actually landed. Every refusal returns
   band where Pillow only *warns*) are both refused with a `how_to_fix` — never a traceback, never a
   warning handed back to the model.
 - **Memory.** A decoded image costs ≈ width × height × channels bytes (a 50 MP RGB image ≈ 150 MB),
-  and a resize holds the source plus the result — budget ~3× the decoded size transiently. That is
-  why the per-frame cap is 50 MP rather than the 100 MP the first plan draft assumed: in-process
-  measurement showed a 95 MP decompression peaking at ~0.77 GB RSS, which left no headroom under the
-  withdrawn cap (measured on a private dataset, not reproducible from this repo — the number sizes
-  the decision, it is not a benchmark you can re-run here).
+  and a resize holds the source plus the result — budget ~3× the decoded size transiently. The caps
+  are sized against that budget, not against the file size on disk: 100 MP summed over frames is
+  ~300 MB decoded and ~900 MB transient, which is what this process can afford. That is why the
+  per-frame cap is 50 MP.
 - **Metadata honesty.** `image_rotate` clears the EXIF orientation tag (it changes pixel
   orientation); resize/crop/convert/optimize preserve EXIF/ICC/DPI, except where the target format
   cannot carry a block — then the response's `notes` list what was dropped (GIF and BMP drop
@@ -117,8 +112,9 @@ single source of truth.
    `hermes plugins validate .` is the strict gate (manifest
    fields, declared-vs-registered tools, security scan). Neither one can see the no-shell rule, the
    cross-toolset naming rule, or README/SKILL drift — the test suite covers those.
-5. Rotation looks doubled → the file predates the fix or was written by another tool; `image_rotate`
-   writes orientation as 1 and `image_info` reports the tag it finds.
+5. Rotation looks doubled → the file carries an orientation tag its pixels no longer match, so
+   whatever wrote it did not clear the tag. `image_rotate` writes orientation as 1 and `image_info`
+   reports the tag it finds.
 6. A write refused with "output already exists" → the default name is a function of (input,
    operation), so re-runs collide. Pass `output_path`, or `overwrite=true` with `confirm=true`.
 
@@ -135,10 +131,9 @@ throwaway env from the uv cache. Offline tests generate all fixtures with Pillow
 EXIF orientation via `Image.Exif()` — no piexif) and assert behaviour: the JSON envelopes, the bytes
 on disk, mode-bit preservation, and that no temp file survives any failure path.
 
-Live checks (not part of the suite) were run against real files — a 8–12 MB JPEG, a PNG with alpha,
-a WebP, an EXIF-rotated photo and an animated GIF — held in a private dataset, so those runs are not
-reproducible from this repo; the numbers they produced are quoted below as measurements of the
-decision, not as benchmarks. The suite itself needs nothing but Pillow.
+The fixture set covers what the format matrix can carry: a JPEG with EXIF/GPS/DPI/ICC, a PNG with
+alpha, a header-only bomb-shaped PNG, an animated GIF and a multi-page TIFF. Checks against real
+camera files are manual and are not part of the suite.
 
 ## Rollback
 
@@ -152,16 +147,16 @@ No state outside the files it writes; the plugin keeps no cache, no database and
 
 ## Decisions and known limits
 
-- The 100 MP per-image cap from the first plan draft was **withdrawn** in favour of 50 MP per frame /
-  100 MP total after in-process measurement showed ~0.77 GB RSS for a 95 MP decode (measured on a
-  private dataset, not reproducible from this repo); the refusal messages state the numbers.
-- Publishing is exclusive instead of `os.replace`-over-everything: a concurrency probe showed the old
-  check-then-replace let two concurrent writers both report success with only one file left — a rare
-  race (~1 in 30 trials on that private dataset, deterministic once the window is widened; not
-  reproducible from this repo). The fix closes the window rather than narrowing it.
-- `confirm=true` is a model-supplied parameter, not a human approval — same design as the house
-  Grocy plugin's dry-run/confirm flags. A `pre_tool_call` hook that blocks in-place overwrites
-  outside an allow-listed directory tree is the v2 candidate; it is not implemented here.
+- The caps are per frame and summed: 50 MP per frame, 100 MP over all frames of one input. Every
+  refusal message names the number it tripped, so the limit is never guessed from a generic error.
+- Publishing is exclusive, not a check-then-replace: `os.link` (with an `O_CREAT|O_EXCL` fallback)
+  fails if a target appeared while the encoder worked, so two concurrent writers cannot both report
+  success with one file. The window is closed, not narrowed — only `overwrite=true` with
+  `confirm=true` replaces an existing file.
+- `confirm=true` is a model-supplied parameter, not a human approval: it is friction the model has to
+  spend deliberately, and the response names the file it replaced. A `pre_tool_call` hook that blocks
+  in-place overwrites outside an allow-listed directory tree is the v2 candidate; it is not
+  implemented here.
 - HEIC/HEIF read/write is out of scope; `image_convert` lists the seven supported targets.
 - GIF frame surgery, drawing/text/watermarks, batch runs and colour correction are out of scope.
 - `image_resize` re-encodes lossy targets at quality 95 unless the format is lossless; the note in

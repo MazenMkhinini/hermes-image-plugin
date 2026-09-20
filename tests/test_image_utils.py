@@ -414,7 +414,7 @@ def test_in_place_needs_both_flags_and_preserves_mode(tmp_path):
     assert done["replaced"] is True
     with Image.open(src) as im:
         assert im.size == (50, 50)
-    assert stat.S_IMODE(os.stat(src).st_mode) == 0o640   # permissions preserved (S-5)
+    assert stat.S_IMODE(os.stat(src).st_mode) == 0o640   # permissions preserved
     no_temps(tmp_path)
 
 

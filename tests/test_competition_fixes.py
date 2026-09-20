@@ -1,8 +1,9 @@
-"""Tests for the competition-fix batch (judge action list J-01..J-26).
+"""Regression tests: each test pins one guarantee that the plugin must keep.
 
-Every test here pins behaviour that was found broken by the review competition
-(reviewer-A.md / reviewer-B.md / devil-advocate.md) or that the judge's action list changed.
-They are written against observable behaviour: the JSON envelope, the bytes on disk, leftovers.
+The guarantees are the stated behaviour of the code — the caps and the refusal messages that carry
+them, TIFF round trips that carry no structural IFD, animation that is never silently dropped, the
+alpha gate, the parameter checks, exclusive publishing, and the no-dead-code rule. Assertions are
+observable: the JSON envelope, the bytes on disk, the leftover temp files.
 
     uv run --python 3.11 --with pytest --with 'pillow==12.3.0' --with pyyaml python -m pytest tests/ -q
 """
@@ -54,26 +55,26 @@ def frames_on_disk(path: Path) -> int:
         return int(getattr(im, "n_frames", 1) or 1)
 
 
-# --------------------------------------------------------------- J-01/J-14/J-16 caps and the bomb band
+# --------------------------------------------------------------- caps and the bomb band
 
 def test_per_frame_cap_refusal_carries_the_header_facts(tmp_path):
     """A 50.4 MP header-only PNG: refused by our cap, and image_info still reports the numbers."""
     src = helpers.make_png_header_only(tmp_path / "hb.png", 8000, 6300)   # 50.4 MP, under Pillow's line
     info = load(tools.image_info(path=str(src)))
     assert "over the 50 MP per-frame cap" in info["error"]
-    assert info["width"] == 8000 and info["height"] == 6300        # J-14: facts, not just prose
+    assert info["width"] == 8000 and info["height"] == 6300        # facts, not just prose
     assert info["pixels"] == 8000 * 6300 and info["decode_ok"] is False
     out = load(tools.image_resize(path=str(src), percent=50))
     assert out["error"] and "50 MP per-frame cap" in out["error"]
 
 
 def test_total_cap_refuses_many_frames(tmp_path, monkeypatch):
-    """The summed-frames cap, exercised with a tiny budget so a real 3-frame GIF trips it (J-16)."""
+    """The summed-frames cap, exercised with a tiny budget so a real 3-frame GIF trips it."""
     monkeypatch.setattr(tools, "MAX_PIXELS_TOTAL", 1000)
     src = helpers.make_animated_gif(tmp_path / "a.gif", frames=3, size=(40, 40))   # 4800 px total
     info = load(tools.image_info(path=str(src)))
     assert "MP total cap" in info["error"]
-    assert info["frames"] == 3 and info["pixels"] == 1600          # J-14 + the real frame count
+    assert info["frames"] == 3 and info["pixels"] == 1600          # and the real frame count
 
 
 def test_bomb_warning_band_is_a_structured_refusal(tmp_path):
@@ -84,11 +85,11 @@ def test_bomb_warning_band_is_a_structured_refusal(tmp_path):
     assert "decompression-bomb guard" in info["how_to_fix"]
     out = load(tools.image_resize(path=str(src), percent=50))
     assert out["error"].startswith("refused:")
-    assert "re-run with the same arguments" not in out["how_to_fix"]            # A-1: no useless retry
+    assert "re-run with the same arguments" not in out["how_to_fix"]            # no useless retry
 
 
 def test_guard_filters_do_not_leak_across_threads(tmp_path):
-    """DA-02: two overlapping guarded regions must not leave an 'error' filter installed process-wide."""
+    """Two overlapping guarded regions must not leave an 'error' filter installed process-wide."""
     holder: list = []
     start = threading.Event()
 
@@ -114,7 +115,7 @@ def test_guard_filters_do_not_leak_across_threads(tmp_path):
     assert any(isinstance(w.message, Image.DecompressionBombWarning) for w in caught)
 
 
-# --------------------------------------------------------------- J-03/J-04 TIFF round trips
+# --------------------------------------------------------------- TIFF round trips
 
 @pytest.mark.parametrize("tool_name,kwargs", [
     ("image_resize", {"percent": 50}),
@@ -122,7 +123,7 @@ def test_guard_filters_do_not_leak_across_threads(tmp_path):
     ("image_rotate", {"angle": 90}),
 ])
 def test_tiff_round_trip_is_readable(tmp_path, tool_name, kwargs):
-    """A-2: the source's structural IFD must not be carried as EXIF, or the output is undecodable."""
+    """The source's structural IFD must not be carried as EXIF, or the output is undecodable."""
     src = make_tiff(tmp_path / "src.tiff", "RGB", (64, 48))
     result = load(getattr(tools, tool_name)(path=str(src), **kwargs))
     assert "error" not in result, result
@@ -135,7 +136,7 @@ def test_tiff_round_trip_is_readable(tmp_path, tool_name, kwargs):
 
 
 def test_tiff_round_trip_keeps_user_tags_but_not_a_stale_orientation(tmp_path):
-    """J-03 measured: Pillow applies a TIFF's orientation to the pixels at load and consumes the tag,
+    """Pillow applies a TIFF's orientation to the pixels at load and consumes the tag,
     so the output must carry no stale orientation (that would double-rotate) while user tags survive."""
     src = tmp_path / "cam.tiff"
     im = Image.new("RGB", (64, 48), (5, 6, 7))
@@ -160,7 +161,7 @@ def test_tiff_round_trip_keeps_user_tags_but_not_a_stale_orientation(tmp_path):
 
 
 def test_animated_gif_to_tiff_writes_every_frame(tmp_path):
-    """J-04: the multi-page TIFF saver re-reads the file it writes, so the temp handle must be r+w."""
+    """The multi-page TIFF saver re-reads the file it writes, so the temp handle must be r+w."""
     src = helpers.make_animated_gif(tmp_path / "a.gif", frames=3, size=(40, 40))
     out = load(tools.image_convert(path=str(src), format="TIFF"))
     assert "error" not in out, out
@@ -168,7 +169,7 @@ def test_animated_gif_to_tiff_writes_every_frame(tmp_path):
     assert frames_on_disk(Path(out["output"])) == 3
 
 
-# --------------------------------------------------------------- J-07 animation is not silently dropped
+# --------------------------------------------------------------- animation is not silently dropped
 
 @pytest.mark.parametrize("tool_name,kwargs", [
     ("image_resize", {"percent": 50}),
@@ -177,7 +178,7 @@ def test_animated_gif_to_tiff_writes_every_frame(tmp_path):
     ("image_optimize", {}),
 ])
 def test_animation_survives_every_geometry_tool(tmp_path, tool_name, kwargs):
-    """A-4: a 3-frame GIF stayed a 3-frame GIF (or the drop is reported in the envelope)."""
+    """A 3-frame GIF stayed a 3-frame GIF (or the drop is reported in the envelope)."""
     src = helpers.make_animated_gif(tmp_path / "a.gif", frames=3, size=(40, 40))
     result = load(getattr(tools, tool_name)(path=str(src), **kwargs))
     assert "error" not in result, result
@@ -189,7 +190,7 @@ def test_animation_survives_every_geometry_tool(tmp_path, tool_name, kwargs):
 
 
 def test_in_place_optimize_never_replaces_an_animation_with_a_still(tmp_path):
-    """A-4's data loss: overwrite+confirm on a GIF used to leave a single-frame file behind."""
+    """An in-place optimize of an animated GIF keeps all frames in the file it replaces."""
     src = helpers.make_animated_gif(tmp_path / "a.gif", frames=3, size=(40, 40))
     result = load(tools.image_optimize(path=str(src), output_path=str(src),
                                        overwrite=True, confirm=True))
@@ -199,14 +200,14 @@ def test_in_place_optimize_never_replaces_an_animation_with_a_still(tmp_path):
     no_temps(tmp_path)
 
 
-# --------------------------------------------------------------- J-05 arbitrary-angle rotate, all modes
+# --------------------------------------------------------------- arbitrary-angle rotate, all modes
 
 @pytest.mark.parametrize("mode,container", [
     ("L", "png"), ("1", "png"), ("LA", "png"), ("I;16", "png"), ("F", "tiff"),
     ("CMYK", "jpg"), ("RGB", "tiff"),
 ])
 def test_rotate_arbitrary_angle_works_for_every_mode(tmp_path, mode, container):
-    """A-3: the fill colour must match the mode's channel shape, or rotate(45) dies."""
+    """The fill colour must match the mode's channel shape, or rotate(45) dies."""
     src = tmp_path / f"src_{mode.replace(';', '_')}.{container}"
     Image.new(mode, (40, 30), 0).save(src)
     out = load(tools.image_rotate(path=str(src), angle=45, background="white"))
@@ -217,7 +218,7 @@ def test_rotate_arbitrary_angle_works_for_every_mode(tmp_path, mode, container):
 
 
 def test_rotate_palette_transparency_keeps_transparency(tmp_path):
-    """A-3: a transparent fill cannot be added to an RGB palette — the plugin must route via RGBA."""
+    """A transparent fill cannot be added to an RGB palette — rotate must route via RGBA."""
     src = helpers.make_palette_transparency(tmp_path / "p.png", size=(60, 40))
     out = load(tools.image_rotate(path=str(src), angle=45))
     assert "error" not in out, out
@@ -227,10 +228,10 @@ def test_rotate_palette_transparency_keeps_transparency(tmp_path):
     assert "palette transparency preserved" in " ".join(out["notes"])
 
 
-# --------------------------------------------------------------- J-06 alpha gate + after.mode honesty
+# --------------------------------------------------------------- alpha gate + after.mode honesty
 
 def test_bmp_flatten_composites_onto_the_background(tmp_path):
-    """A-5: flatten=true with a background must actually composite, and after.mode must be true."""
+    """flatten=true with a background must actually composite, and after.mode must be true."""
     src = helpers.make_alpha_png(tmp_path / "a.png", size=(40, 40), color=(255, 0, 0, 128))
     out = load(tools.image_convert(path=str(src), format="BMP", flatten=True, background="black"))
     assert "error" not in out, out
@@ -252,7 +253,7 @@ def test_bmp_and_gif_refuse_silent_alpha_loss(tmp_path):
 
 
 def test_after_mode_is_read_back_from_the_file(tmp_path):
-    """A-11: a 1-bit PNG written as JPEG is mode L on disk, and the envelope must say so."""
+    """A 1-bit PNG written as JPEG is mode L on disk, and the envelope must say so."""
     src = tmp_path / "1bit.png"
     Image.new("1", (40, 40), 1).save(src)
     out = load(tools.image_convert(path=str(src), format="JPEG"))
@@ -261,7 +262,7 @@ def test_after_mode_is_read_back_from_the_file(tmp_path):
     assert out["before"]["mode"] == "1"
 
 
-# --------------------------------------------------------------- J-09/J-13/J-19 parameter truth
+# --------------------------------------------------------------- parameter truth
 
 def test_resize_rejects_nonfinite_and_absurd_targets(tmp_path):
     src = helpers.make_photo(tmp_path / "p.jpg", size=(100, 100))
@@ -289,10 +290,10 @@ def test_resize_rejects_bool_and_fractional_dimensions(tmp_path):
     assert "error" not in out, out
 
 
-# --------------------------------------------------------------- J-11/J-15/J-17/J-18/J-20/J-21 texts
+# --------------------------------------------------------------- notes and refusal texts
 
 def test_strip_metadata_really_strips_icc_and_exif(tmp_path):
-    """A-7: PNG/TIFF kept the ICC profile while the note claimed it had been dropped."""
+    """strip_metadata=true must really remove ICC, EXIF and DPI from a PNG, not only claim it."""
     src = helpers.make_photo(tmp_path / "p.jpg", size=(80, 60), dpi=(300, 300), icc=b"\x11" * 64)
     as_png = tmp_path / "p.png"
     Image.open(src).save(as_png, icc_profile=b"\x11" * 64)
@@ -314,7 +315,7 @@ def test_output_suffix_mismatch_is_noted_for_any_suffix(tmp_path):
 
 
 def test_forced_png_fallback_is_noted(tmp_path):
-    """DA-03: an input format Pillow cannot write falls back to PNG — that must be visible."""
+    """An input format Pillow cannot write falls back to PNG — that must be visible."""
     src = tmp_path / "x.ppm"
     Image.new("RGB", (30, 20), (1, 2, 3)).save(src)
     out = load(tools.image_crop(path=str(src), box=[0, 0, 20, 20]))
@@ -359,7 +360,7 @@ def test_cmyk_to_png_names_the_mode_in_the_hint(tmp_path):
     assert "TIFF" in out["how_to_fix"] and "JPEG" in out["how_to_fix"]
 
 
-# --------------------------------------------------------------- J-10 exclusive publish
+# --------------------------------------------------------------- exclusive publish
 
 def test_exclusive_publish_refuses_an_existing_target(tmp_path):
     target = tmp_path / "out.png"
@@ -381,7 +382,7 @@ def test_atomic_write_leaves_no_temp_and_writes_the_bytes(tmp_path):
 
 
 def test_atomic_write_refuses_a_mismatched_encoder(tmp_path):
-    """J-03's guard: a file that reopens at the wrong size is refused instead of published."""
+    """A file that reopens at the wrong size is refused instead of published."""
     target = tmp_path / "out.png"
 
     def liar(fh):
@@ -405,10 +406,10 @@ def test_atomic_write_honours_the_strip_expectation(tmp_path):
     no_temps(tmp_path)
 
 
-# --------------------------------------------------------------- J-24/J-26 dead code and claims
+# --------------------------------------------------------------- dead code and claims
 
 def test_no_dead_helpers_remain():
-    """J-24: the never-called envelope builder and the unused binding are gone."""
+    """No dead code: no unused envelope builder and no unused binding in tools.py."""
     import ast
 
     source = Path(tools.__file__).read_text(encoding="utf-8")
@@ -419,7 +420,7 @@ def test_no_dead_helpers_remain():
 
 
 def test_resize_drafts_the_jpeg_before_decoding(tmp_path, monkeypatch):
-    """B-4/J-26: draft() must run before the decode, or the reported memory saving never happens."""
+    """draft() must run before the decode, or the reported memory saving never happens."""
     from PIL import JpegImagePlugin
 
     calls = []

@@ -4,22 +4,22 @@ Every handler returns a JSON string (Hermes tool contract). Failures come back a
 ``{"error": ..., "how_to_fix": ...}`` envelopes — never as raised exceptions, which would surface as
 a tool crash in the agent loop. Keywords and JSON (not prints) carry the data.
 
-Safety contract (PLAN v1.1, amended after the adversarial plan review):
+Safety contract:
 
 - Pillow is the only engine: no subprocess, no shell, no ImageMagick, no new dependencies. The
   Pillow import is guarded so a broken Pillow (or a Pillow-less venv) leaves the plugin *registering*
-  its tools: ``image_info`` then explains the state instead of the plugin vanishing (review S-3/A-2).
+  its tools: ``image_info`` then explains the state instead of the plugin vanishing.
 - Inputs: regular files only, <= 50 MB, <= 50 MP per frame, <= 100 MP summed over frames. Pillow's
   own ``MAX_IMAGE_PIXELS`` guard is never disabled and is escalated to an error for the duration of
-  every ``open()``/``load()`` so a decompression bomb is a structured refusal, not a warning (S-1).
+  every ``open()``/``load()`` so a decompression bomb is a structured refusal, not a warning.
 - Writes never overwrite by default: a new path, or ``overwrite=true`` *and* ``confirm=true``.
 - Writes are atomic: temp file in the target's directory, fsync, output-cap check, a re-read check of
   the encoded bytes, then an exclusive publish (``os.link`` with an O_EXCL fallback, unless
   ``overwrite=true`` *and* ``confirm=true`` asked for a replace); the temp file is removed on every
-  failure path (S-6, J-03/J-10).
+  failure path.
 - Every write reports before -> after (dimensions, format, mode, bytes) and the output path.
-- Metadata is carried by presence (never ``.get()``-with-``None``, which crashes the savers — P-4);
-  ``image_rotate`` always clears the EXIF orientation tag because it changes pixel orientation (P-2).
+- Metadata is carried by presence (never ``.get()``-with-``None``, which crashes the savers);
+  ``image_rotate`` always clears the EXIF orientation tag because it changes pixel orientation.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ logger = logging.getLogger("hermes_image_utils")
 
 TOOLSET = "image_utils"
 
-try:  # guarded import: a missing Pillow must not kill plugin registration (S-3/A-2)
+try:  # guarded import: a missing Pillow must not kill plugin registration
     from PIL import Image, ImageOps, ImageSequence
 
     _PIL_AVAILABLE = True
@@ -66,7 +66,7 @@ EXTENSION_ALIASES: Dict[str, str] = {
     ".tif": "TIFF", ".tiff": "TIFF", ".gif": "GIF", ".avif": "AVIF", ".bmp": "BMP",
 }
 
-# Which metadata each target format can carry (measured on Pillow 12.3.0, probe plan-api/p12).
+# Which metadata each target format can carry (frozen for Pillow 12.3.0).
 # Pillow has no runtime introspection API for this, so it is a frozen table with a test per row.
 FORMAT_METADATA_SUPPORT: Dict[str, set] = {
     "exif": {"PNG", "JPEG", "WEBP", "TIFF", "AVIF"},
@@ -125,11 +125,11 @@ _GUARD_LOCK = threading.RLock()
 
 @contextmanager
 def _guarded():
-    """Turn Pillow's decompression-bomb *warning* into an error for this open/decode (S-1/A-9).
+    """Turn Pillow's decompression-bomb *warning* into an error for this open/decode.
 
     ``MAX_IMAGE_PIXELS`` itself is never touched. ``warnings.catch_warnings`` mutates the
     process-global filter list and Hermes runs tool calls in worker threads, so two overlapping
-    calls could otherwise leave the 'error' filter installed after both exited (DA-02); the toggle
+    calls could otherwise leave the 'error' filter installed after both exited; the toggle
     is serialised with ``_GUARD_LOCK`` (warnings filters cannot be made thread-local).
     """
     if Image is None:
@@ -211,7 +211,7 @@ def _open_source(raw_path: Any) -> Tuple[Any, Path, int]:
             im = Image.open(path)
         except Image.DecompressionBombError as exc:  # not an OSError — must be caught explicitly
             raise _bomb_error(exc)
-        except Image.DecompressionBombWarning as exc:  # _guarded() escalates the 89.5-179 MP band (A-1)
+        except Image.DecompressionBombWarning as exc:  # _guarded() escalates the 89.5-179 MP band
             raise _bomb_error(exc)
         except Image.UnidentifiedImageError:
             raise _unidentified(path)
@@ -246,7 +246,7 @@ def _open_source(raw_path: Any) -> Tuple[Any, Path, int]:
     if (im.format or "").upper() == "TIFF":
         try:
             # Pillow's TIFF reader applies the orientation to the pixels and consumes the tag when
-            # the image is loaded; snapshot it at header time so the notes can tell the truth (J-03).
+            # the image is loaded; snapshot it at header time so the notes can tell the truth.
             orientation = im.getexif().get(_EXIF_ORIENTATION)
         except Exception:
             orientation = None
@@ -255,13 +255,13 @@ def _open_source(raw_path: Any) -> Tuple[Any, Path, int]:
 
 
 def _decode(im: Any) -> None:
-    """Decode the pixels. ``open()`` only reads headers; a truncated file only fails here (S-7/P-11)."""
+    """Decode the pixels. ``open()`` only reads headers; a truncated file only fails here."""
     with _guarded():
         try:
             im.load()
         except Image.DecompressionBombError as exc:
             raise _bomb_error(exc)
-        except Image.DecompressionBombWarning as exc:  # escalated warning, same refusal (A-1)
+        except Image.DecompressionBombWarning as exc:  # escalated warning, same refusal
             raise _bomb_error(exc)
         except (OSError, ValueError) as exc:
             message = str(exc)
@@ -305,7 +305,7 @@ def _target_for(im: Any, src: Path, output_path: Any, operation: str, fmt: Optio
 
 
 def _format_notes(source_im: Any, target: Path, fmt: str) -> List[str]:
-    """Notes about a forced format fallback and about the name not matching the bytes (J-15)."""
+    """Notes about a forced format fallback and about the name not matching the bytes."""
     notes: List[str] = []
     source_fmt = (source_im.format or "").upper()
     if source_fmt and source_fmt not in SAVE_FORMATS:
@@ -378,7 +378,7 @@ def _resolve_target(src: Path, output_path: Any, operation: str, fmt: str,
 # --------------------------------------------------------------------------- output handling
 
 def _publish_exclusive(tmp: Path, target: Path) -> None:
-    """Publish ``tmp`` as ``target`` only if nothing is at ``target`` (J-10: closes the TOCTOU)."""
+    """Publish ``tmp`` as ``target`` only if nothing is at ``target`` (no TOCTOU window)."""
     try:
         os.link(tmp, target)          # atomic create-exclusive where hard links exist
         return
@@ -412,7 +412,7 @@ def _publish_exclusive(tmp: Path, target: Path) -> None:
 
 
 def _verify_encoded(tmp: Path, expect: Optional[Dict[str, Any]]) -> None:
-    """Re-read the encoded temp file before publishing it: size, frame count, decodability (J-03)."""
+    """Re-read the encoded temp file before publishing it: size, frame count, decodability."""
     if not expect:
         return
     try:
@@ -451,7 +451,7 @@ def _verify_encoded(tmp: Path, expect: Optional[Dict[str, Any]]) -> None:
 
 def _write_atomic(target: Path, writer: Callable[[Any], None], overwrite: bool, confirm: bool,
                   expect: Optional[Dict[str, Any]] = None) -> int:
-    """Encode into a same-directory temp file, verify it, then publish it (S-6, J-03, J-04, J-10)."""
+    """Encode into a same-directory temp file, verify it, then publish it."""
     parent = target.parent
     try:
         fd, tmp_name = tempfile.mkstemp(dir=str(parent), prefix=f".{target.stem}.", suffix=".tmp")
@@ -463,7 +463,7 @@ def _write_atomic(target: Path, writer: Callable[[Any], None], overwrite: bool, 
         )
     tmp: Optional[Path] = Path(tmp_name)
     try:
-        with os.fdopen(fd, "w+b") as fh:   # w+b: the multi-page TIFF saver re-reads what it writes (J-04)
+        with os.fdopen(fd, "w+b") as fh:   # w+b: the multi-page TIFF saver re-reads what it writes
             writer(fh)
             fh.flush()
             os.fsync(fh.fileno())
@@ -507,7 +507,7 @@ def _before(im: Any, src_bytes: int) -> Dict[str, Any]:
 
 
 def _after_from_disk(target: Path, size: int, fmt: str) -> Dict[str, Any]:
-    """After-facts read back from the file that was written: the bytes are the truth (J-12/A-11)."""
+    """After-facts read back from the file that was written: the bytes are the truth."""
     facts: Dict[str, Any] = {"format": fmt, "bytes": int(size), "path": str(target),
                              "dimensions": None, "mode": None}
     try:
@@ -602,7 +602,7 @@ _TIFF_SAFE_EXIF_TAGS = (0x010F, 0x0110, 0x0112, 0x0132, 0x8825, 0x9003, 0x9004, 
 
 
 def _safe_exif(source_fmt: str, exif: Any) -> Any:
-    """Keep only user-level tags when the source's IFD is its structural directory (J-03/A-2).
+    """Keep only user-level tags when the source's IFD is its structural directory.
 
     A TIFF's ``getexif()`` *is* the image's IFD (StripOffsets, TileOffsets, BitsPerSample, …);
     writing it onto a re-encoded image makes the file declare the source's geometry.
@@ -632,7 +632,7 @@ def _save_kwargs(im: Any, fmt: str, *, quality: Any = None, effort: Any = None,
     dropped: List[str] = []
 
     if strip_metadata:
-        # J-11: an explicit empty value beats Pillow's own carry-into from im.info (PNG/TIFF)
+        # An explicit empty value beats Pillow's own carry-into from im.info (PNG/TIFF)
         kwargs["icc_profile"] = b""
     if not strip_metadata:
         want_exif = exif_override is not None or ("exif" in im.info) or len(im.getexif()) > 0
@@ -640,7 +640,7 @@ def _save_kwargs(im: Any, fmt: str, *, quality: Any = None, effort: Any = None,
             if fmt in FORMAT_METADATA_SUPPORT["exif"]:
                 try:
                     ex = exif_override if exif_override is not None else im.getexif()
-                    ex = _safe_exif(im.format, ex)   # J-03/A-2: never round-trip a TIFF's structural IFD
+                    ex = _safe_exif(im.format, ex)   # never round-trip a TIFF's structural IFD
                     if len(ex):  # an empty Exif would write a useless APP1 block
                         kwargs["exif"] = ex.tobytes()
                 except Exception as exc:  # metadata is never worth failing a write over
@@ -791,7 +791,7 @@ def image_resize(**params: Any) -> str:
         allow_upscale = bool(params.get("allow_upscale", False))
         resample_name = params.get("resample", "lanczos")
 
-        im, src, src_bytes = _open_source(params.get("path"))   # header-only: draft() needs it (B-4)
+        im, src, src_bytes = _open_source(params.get("path"))   # header-only: draft() needs the dimensions first
         try:
             src_w, src_h = int(im.size[0]), int(im.size[1])
             mode = im.mode
@@ -842,13 +842,13 @@ def image_resize(**params: Any) -> str:
                 raise ToolError(
                     f"target {tgt_w}x{tgt_h} = {tgt_w * tgt_h:,} pixels, over the "
                     f"{MAX_PIXELS_PER_FRAME // 1_000_000} MP per-frame cap",
-                    "choose a smaller target; the cap protects this process's memory (J-09)",
+                    "choose a smaller target; the cap protects this process's memory",
                 )
 
             target, replaced, fmt = _target_for(im, src, params.get("output_path"), "resize", None,
                                                 params.get("overwrite", False),
                                                 params.get("confirm", False))
-            resample_key = str(resample_name or "").strip().lower() or "lanczos"   # J-13
+            resample_key = str(resample_name or "").strip().lower() or "lanczos"
             resample = _pick_resample(resample_key)
             drafted = False
             if (fmt == "JPEG" and im.mode in ("RGB", "L")
@@ -859,7 +859,7 @@ def image_resize(**params: Any) -> str:
                     drafted = True
                 except Exception:
                     pass
-            _decode(im)   # decoded AFTER draft(), so draft() really does cut the decode (B-4)
+            _decode(im)   # decoded AFTER draft(), so draft() really does cut the decode
             frames, durations = _frames_of(im)
             result_frames = [frame.resize((tgt_w, tgt_h), resample=resample) for frame in frames]
             result_frames, extra, frames_written, frames_dropped, frame_notes = _animation_extra(
@@ -915,7 +915,7 @@ def image_crop(**params: Any) -> str:
         im, src, src_bytes = _open_decoded(params.get("path"))
         try:
             src_w, src_h = int(im.size[0]), int(im.size[1])
-            before = _before(im, src_bytes)   # J-12: before any frame iteration mutates im.mode
+            before = _before(im, src_bytes)   # before any frame iteration mutates im.mode
 
             if box is not None:
                 if not isinstance(box, (list, tuple)) or len(box) != 4:
@@ -1053,14 +1053,14 @@ def image_rotate(**params: Any) -> str:
             notes: List[str] = []
             orientation_applied = False
             original_orientation = im.getexif().get(_EXIF_ORIENTATION)
-            source_before = _before(im, src_bytes)   # captured before any transpose (P-2)
+            source_before = _before(im, src_bytes)   # captured before any transpose
 
             target, replaced, fmt = _target_for(im, src, params.get("output_path"), "rotate", None,
                                                 params.get("overwrite", False),
                                                 params.get("confirm", False))
             notes.extend(_format_notes(im, target, fmt))
             if auto_orient and original_orientation not in (None, 1):
-                im = ImageOps.exif_transpose(im)  # returns a copy; never in_place=True (P-2)
+                im = ImageOps.exif_transpose(im)  # returns a copy; never in_place=True
                 orientation_applied = True
                 notes.append(f"EXIF orientation {original_orientation} applied")
 
@@ -1071,7 +1071,7 @@ def image_rotate(**params: Any) -> str:
                         raise ToolError(
                             f"nothing to do: the file's EXIF orientation is {original_orientation} "
                             f"but auto_orient=false",
-                            "pass auto_orient=true to normalise it, or an explicit angle (J-18)",
+                            "pass auto_orient=true to normalise it, or an explicit angle",
                         )
                     raise ToolError("nothing to do: no angle and no EXIF orientation to apply",
                                     "pass angle=90/180/270 (or any degree value), or set auto_orient "
@@ -1124,7 +1124,7 @@ def image_rotate(**params: Any) -> str:
                     notes.append(fill_note)
             notes.extend(frame_notes)
 
-            # image_rotate ALWAYS clears the orientation tag where the target can carry EXIF (P-2/J-21).
+            # image_rotate ALWAYS clears the orientation tag where the target can carry EXIF.
             exif = im.getexif()
             exif[_EXIF_ORIENTATION] = 1
             kwargs, meta_notes, dropped, _ = _save_kwargs(im, fmt, geometry_quality=True, exif_override=exif)
@@ -1173,7 +1173,7 @@ def image_convert(**params: Any) -> str:
 
         im, src, src_bytes = _open_decoded(params.get("path"))
         try:
-            before = _before(im, src_bytes)   # J-12: before frame iteration mutates im.mode
+            before = _before(im, src_bytes)   # before frame iteration mutates im.mode
             target, replaced, fmt = _target_for(im, src, params.get("output_path"), "convert", fmt,
                                                 params.get("overwrite", False),
                                                 params.get("confirm", False))
@@ -1200,7 +1200,7 @@ def image_convert(**params: Any) -> str:
 
             animate = fmt in _save_all_formats() and len(frames) > 1
             if animate and fmt == "PNG":
-                frames = [f.convert("RGBA") for f in frames]  # P-mode frames break APNG saving (P-7)
+                frames = [f.convert("RGBA") for f in frames]  # P-mode frames break APNG saving
             if animate:
                 frames_written, frames_dropped = len(frames), 0
             else:
@@ -1269,7 +1269,7 @@ def image_optimize(**params: Any) -> str:
     try:
         im, src, src_bytes = _open_decoded(params.get("path"))
         try:
-            before = _before(im, src_bytes)   # J-12: before frame iteration mutates im.mode
+            before = _before(im, src_bytes)   # before frame iteration mutates im.mode
             if (im.format or "").upper() not in SAVE_FORMATS:
                 im.close()
                 raise ToolError(
@@ -1344,7 +1344,7 @@ def image_optimize(**params: Any) -> str:
 # --------------------------------------------------------------------------- frame helpers
 
 def _whole_int(value: Any, label: str, minimum: int = 1) -> int:
-    """A strict integer parameter: reject bools, NaN and fractional floats (J-19/A-13)."""
+    """A strict integer parameter: reject bools, NaN and fractional floats."""
     if isinstance(value, bool):
         raise ToolError(f"{label} must be a number, got {value!r}", f"pass {label}=<pixels>")
     try:
@@ -1362,7 +1362,7 @@ def _whole_int(value: Any, label: str, minimum: int = 1) -> int:
 
 
 def _rotate_fill(im: Any, background: Any) -> Tuple[Any, Any, Optional[str]]:
-    """Return (image to rotate, fillcolor, note) with the fill shaped for the image's mode (J-05/A-3).
+    """Return (image to rotate, fillcolor, note) with the fill shaped for the image's mode.
 
     Shapes measured on Pillow 12.3.0: int for L/1/I/I;16, float for F, 2-tuple for LA, 3-tuple for
     RGB/CMYK/LAB/YCbCr/plain-P, 4-tuple for RGBA/RGBa/La. A P image with palette transparency is
@@ -1388,7 +1388,7 @@ def _rotate_fill(im: Any, background: Any) -> Tuple[Any, Any, Optional[str]]:
 
 
 def _orientation_note(im: Any, operation: str) -> str:
-    """Honest orientation note for a geometry write (J-03: Pillow consumes a TIFF's tag at load)."""
+    """Honest orientation note for a geometry write (Pillow consumes a TIFF's tag at load)."""
     consumed = getattr(im, "_hermes_tiff_orientation", None)
     if consumed not in (None, 1):
         return (f"EXIF orientation {consumed} was applied by Pillow's TIFF reader at load; the "
@@ -1398,12 +1398,12 @@ def _orientation_note(im: Any, operation: str) -> str:
 
 def _animation_extra(fmt: str, frames: List[Any], durations: List[Optional[int]], loop: Any
                      ) -> Tuple[List[Any], Dict[str, Any], int, int, List[str]]:
-    """save_all kwargs + frame accounting for a possibly animated write (J-07/A-4).
+    """save_all kwargs + frame accounting for a possibly animated write.
 
     Returns ``(frames_to_write, extra_kwargs, frames_written, frames_dropped, notes)``.
     """
     if len(frames) > 1 and fmt in _save_all_formats():
-        if fmt == "PNG":   # P-mode frames break APNG saving (P-7)
+        if fmt == "PNG":   # P-mode frames break APNG saving
             frames = [f if f.mode in ("RGB", "RGBA") else f.convert("RGBA") for f in frames]
         duration = [int(d) if d else 100 for d in durations]
         if len(duration) != len(frames):
@@ -1434,7 +1434,7 @@ def _frames_of(im: Any) -> Tuple[List[Any], List[Optional[int]]]:
 
 
 def _flatten_frame(frame: Any, rgb: Tuple[int, int, int]) -> Any:
-    """Composite an alpha-bearing frame onto a solid background (never ``convert('RGB')`` — P-8)."""
+    """Composite an alpha-bearing frame onto a solid background (never ``convert('RGB')``)."""
     rgba = frame.convert("RGBA")
     base = Image.new("RGB", frame.size, rgb)
     base.paste(rgba, mask=rgba.split()[3])

@@ -3,7 +3,7 @@
 Design notes (guarded Pillow import + one always-on diagnostic tool + one shared availability probe):
 
 - ``tools.py`` imports Pillow **guarded**, so a missing/unimportable Pillow cannot make the plugin
-  register nothing (plan review S-3/A-2). ``image_info`` is registered WITHOUT a ``check_fn`` so it
+  register nothing. ``image_info`` is registered WITHOUT a ``check_fn`` so it
   stays visible as the diagnostic and reports ``pillow_available``; the five write tools share one
   Pillow-availability probe whose result the registry caches for 30 s.
 - Toolset ``image_utils``. No config, no secrets, no network, no shell: Pillow in-process only.
@@ -77,7 +77,7 @@ def register(ctx) -> None:
 
         probe = _pillow_available
         registered = []
-        for schema in schemas.all_schemas():  # image_info is first: keeps the toolset exposable (A-2)
+        for schema in schemas.all_schemas():  # image_info is first: keeps the toolset exposable
             name = schema["name"]
             handler = handlers.get(name)
             if handler is None:

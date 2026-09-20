@@ -6,7 +6,7 @@ calling a tool is stated here — default output naming, the overwrite/confirm g
 format/metadata behaviour.
 
 This module deliberately imports no Pillow: the schema text is static, and a broken Pillow must not
-stop the plugin from registering (plan review A-2).
+stop the plugin from registering.
 """
 
 from __future__ import annotations

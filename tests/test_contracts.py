@@ -1,9 +1,9 @@
 """Contract tests for the Hermes ``image-utils`` plugin.
 
-These cover the rules that neither ``hermes plugins doctor`` nor ``hermes plugins validate`` can see
-(plan review A-7/A-13): source-level guarantees (no shell, no pillow_heif, no MAX_IMAGE_PIXELS
-assignment), the cross-toolset naming rule, the JSON envelopes, the Pillow-absent behaviour, and
-README/SKILL parity. Everything else is asserted through behaviour in ``test_image_utils.py``.
+These cover the rules that neither ``hermes plugins doctor`` nor ``hermes plugins validate`` can see:
+source-level guarantees (no shell, no pillow_heif, no MAX_IMAGE_PIXELS assignment), the cross-toolset
+naming rule, the JSON envelopes, the Pillow-absent behaviour, and README/SKILL parity. Everything
+else is asserted through behaviour in ``test_image_utils.py``.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ def test_manifest_required_fields_and_no_python_dependencies():
         assert manifest.get(key), f"plugin.yaml missing {key}"
     assert manifest["name"] == "image-utils"
     assert manifest["kind"] == "standalone"
-    assert "python_dependencies" not in manifest          # A-14: Pillow is a venv fact, not a dep
+    assert "python_dependencies" not in manifest          # Pillow is a venv fact, not a dep
 
 
 def test_schema_shape_is_the_inner_function_object():
