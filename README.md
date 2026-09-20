@@ -105,6 +105,11 @@ No `platform_toolsets` entry is needed in Hermes 0.21.3: plugin toolsets are ena
 every platform (`_enabled_plugin_toolsets`), proven live under a temp `HERMES_HOME` — add an entry
 only to pin one platform's list.
 
+`install.sh` is a POSIX shell script, which covers Linux and macOS. Windows has no `sh`, and `ln -s`
+there needs developer mode, so install by hand: copy this directory to
+`<profile-home>/plugins/image-utils`, then run `hermes -p <profile> plugins enable image-utils`. The
+test suite runs on Linux, macOS and Windows (`.github/workflows/tests.yml`).
+
 No configuration keys and no secrets. Plugins are per-profile (`$HERMES_HOME/plugins/`) and
 opt-in (`plugins.enabled`), so a directory alone loads nothing; the symlink keeps this checkout the
 single source of truth.
