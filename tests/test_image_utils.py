@@ -461,3 +461,182 @@ def test_convert_refuses_non_image_and_missing(tmp_path):
 def test_pillow_guard_is_never_disabled():
     assert Image.MAX_IMAGE_PIXELS == 89_478_485
     assert ImageFile.LOAD_TRUNCATED_IMAGES is False
+
+
+def test_convert_to_a_still_target_reports_only_the_frames_it_wrote(tmp_path):
+    """A still target decodes frame 0 only, so frame_durations describes what was written."""
+    src = helpers.make_animated_gif(tmp_path / "loop.gif", frames=6, duration=40)
+    jpg = load(tools.image_convert(path=str(src), format="jpeg"))
+    assert jpg["frames_written"] == 1 and jpg["frames_dropped"] == 5
+    assert len(jpg["frame_durations"]) == 1        # the frames that were not written are not listed
+    assert any("frames_dropped=5" in note for note in jpg["notes"])
+
+
+def test_default_effort_does_not_inherit_the_encoders_slow_setting(tmp_path):
+    """No effort given must not mean "use the encoder's slowest sane default"."""
+    photo = helpers.make_photo(tmp_path / "p.jpg", size=(90, 70))
+    webp = load(tools.image_convert(path=str(photo), format="webp",
+                                    output_path=str(tmp_path / "d.webp")))
+    assert any("effort not given -> WebP method 2" in note for note in webp["notes"])
+    avif = load(tools.image_convert(path=str(photo), format="avif",
+                                    output_path=str(tmp_path / "d.avif")))
+    assert any("effort not given -> AVIF speed 8" in note for note in avif["notes"])
+
+
+def test_effort_nine_stops_short_of_the_slowest_webp_method(tmp_path):
+    """effort=9 must not reach WebP method 6, which is the slowest for ~0.2% fewer bytes."""
+    photo = helpers.make_photo(tmp_path / "p.jpg", size=(90, 70))
+    top = load(tools.image_convert(path=str(photo), format="webp", effort=9,
+                                   output_path=str(tmp_path / "e9.webp")))
+    assert any("effort 9 -> WebP method 5" in note for note in top["notes"])
+
+
+def test_optimize_always_states_the_size_outcome(tmp_path):
+    """A re-encode used to report success without saying whether any bytes were saved."""
+    flat = tmp_path / "flat.png"
+    Image.new("RGB", (60, 40), (10, 20, 30)).save(flat)
+    out = load(tools.image_optimize(path=str(flat), output_path=str(tmp_path / "opt.png")))
+    assert os.path.getsize(out["output"]) == os.path.getsize(flat), "fixture can no longer shrink"
+    # the "nothing was saved" branch specifically - the pre-existing "LARGER than the input"
+    # warning would satisfy a looser assertion without the change being present at all
+    assert any("nothing was saved" in n for n in out["notes"]), out["notes"]
+
+
+def test_optimize_max_dimension_reports_the_true_source_geometry(tmp_path):
+    """draft() shrinks im.size; the resize note must still name the file's real dimensions."""
+    photo = helpers.make_photo(tmp_path / "big.jpg", size=(1200, 900))
+    out = load(tools.image_optimize(path=str(photo), max_dimension=300,
+                                    output_path=str(tmp_path / "small.jpg")))
+    assert out["resized"] is True
+    assert out["after"]["dimensions"] == [300, 225]
+    assert any("resized 1200x900 -> 300x225" in note for note in out["notes"])
+    assert any("JPEG draft decode used" in note for note in out["notes"])
+
+
+def test_optimize_drafts_before_decoding(tmp_path, monkeypatch):
+    """The draft must run before the decode, or the saving it exists for never happens."""
+    from PIL import JpegImagePlugin
+
+    calls = []
+    original = JpegImagePlugin.JpegImageFile.draft
+
+    def spy(self, mode, size):
+        calls.append({"decoded_already": not bool(getattr(self, "tile", None))})
+        return original(self, mode, size)
+
+    monkeypatch.setattr(JpegImagePlugin.JpegImageFile, "draft", spy)
+    src = helpers.make_noise_jpeg(tmp_path / "n.jpg", size=(1200, 900))
+    out = load(tools.image_optimize(path=str(src), max_dimension=300,
+                                    output_path=str(tmp_path / "o.jpg")))
+    assert "error" not in out, out
+    assert calls, "draft() was never called for a JPEG max_dimension downscale"
+    assert calls[0]["decoded_already"] is False, "draft() ran after the pixels were decoded"
+
+
+def test_save_kwargs_carry_the_default_encoder_settings(tmp_path):
+    """The note and the encoder setting are one decision, so pin the knob, not the message."""
+    photo = helpers.make_photo(tmp_path / "p.jpg", size=(80, 60))
+    im = Image.open(photo)
+    try:
+        webp, notes, _, _ = tools._save_kwargs(im, "WEBP", quality=85)
+        assert webp.get("method") == tools.WEBP_DEFAULT_METHOD == 2
+        assert any("effort not given" in n for n in notes)
+        avif, _, _, _ = tools._save_kwargs(im, "AVIF", quality=85)
+        assert avif.get("speed") == tools.AVIF_DEFAULT_SPEED == 8
+        top, _, _, _ = tools._save_kwargs(im, "WEBP", quality=85, effort=9)
+        assert top.get("method") == tools.WEBP_MAX_METHOD == 5
+        png, _, _, _ = tools._save_kwargs(im, "PNG")
+        assert "method" not in png and "speed" not in png   # the defaults are WebP/AVIF only
+    finally:
+        im.close()
+
+
+def test_default_encoder_settings_reach_the_encoder(tmp_path):
+    """Pin the effect: the default must not be what Pillow would have done anyway."""
+    src = helpers.make_noise_jpeg(tmp_path / "n.jpg", size=(400, 300))
+    default = load(tools.image_convert(path=str(src), format="webp",
+                                       output_path=str(tmp_path / "d.webp")))
+    top = load(tools.image_convert(path=str(src), format="webp", effort=9,
+                                   output_path=str(tmp_path / "e9.webp")))
+    assert os.path.getsize(default["output"]) != os.path.getsize(top["output"])
+
+
+def test_draft_note_is_absent_when_the_decode_was_not_reduced(tmp_path):
+    """draft() is a no-op below a 2x reduction; the note must not claim a reduced decode."""
+    src = helpers.make_noise_jpeg(tmp_path / "n.jpg", size=(1200, 900))
+    shallow = load(tools.image_optimize(path=str(src), max_dimension=1100,
+                                        output_path=str(tmp_path / "s.jpg")))
+    assert shallow["resized"] is True
+    assert not any("draft decode" in n for n in shallow["notes"]), shallow["notes"]
+
+    deep = load(tools.image_optimize(path=str(src), max_dimension=300,
+                                     output_path=str(tmp_path / "d.jpg")))
+    assert any("draft decode" in n for n in deep["notes"])
+
+
+def test_still_target_note_admits_the_dropped_frames_were_not_read(tmp_path):
+    """The walk is skipped for a still target, so the note must say what was not checked."""
+    src = helpers.make_animated_gif(tmp_path / "a.gif", frames=6, duration=40)
+    out = load(tools.image_convert(path=str(src), format="jpeg"))
+    assert out["frames_written"] == 1 and out["frames_dropped"] == 5
+    assert any("neither decoded nor validated" in n for n in out["notes"]), out["notes"]
+
+
+def test_a_damaged_later_frame_is_not_read_when_the_walk_is_skipped(tmp_path, monkeypatch):
+    """The accepted cost of skipping the walk, pinned from both sides.
+
+    Every frame after the first is made to fail when decoded, as a truncated animation would. A still
+    target converts anyway - it never reads them - and says so in the note. An animated target still
+    walks, so it still sees the damage and refuses. Removing the walk breaks the first half; restoring
+    it breaks the second.
+    """
+    from PIL import ImageSequence
+
+    src = helpers.make_animated_gif(tmp_path / "a.gif", frames=6, duration=40)
+    original = ImageSequence.Iterator
+
+    class DamagedFromSecondFrame:
+        def __init__(self, im):
+            self._inner = iter(original(im))
+            self._yielded = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self._yielded += 1
+            if self._yielded > 1:
+                raise OSError("image file is truncated (0 bytes not processed)")
+            return next(self._inner)
+
+    monkeypatch.setattr(ImageSequence, "Iterator", DamagedFromSecondFrame)
+
+    still = load(tools.image_convert(path=str(src), format="jpeg"))
+    assert "error" not in still, still
+    assert still["frames_written"] == 1
+    assert any("neither decoded nor validated" in n for n in still["notes"]), still["notes"]
+
+    walked = load(tools.image_convert(path=str(src), format="png",
+                                      output_path=str(tmp_path / "a.png")))
+    assert "error" in walked, "an animated target still walks, so it must see the damage"
+
+
+def test_header_stage_checks_run_before_the_pixel_decode(tmp_path):
+    """Documents the precedence: parameter and path checks precede the decode, so a damaged file
+    whose output path is taken is reported as the path collision."""
+    src = helpers.make_noise_jpeg(tmp_path / "n.jpg", size=(400, 300))
+    helpers.truncate(src, 0.5)
+    clash = tmp_path / "clash.jpg"
+    clash.write_bytes(b"x")
+    out = load(tools.image_optimize(path=str(src), output_path=str(clash)))
+    assert "error" in out
+    assert "already exists" in out["error"], out["error"]
+
+
+def test_geometry_tools_inherit_the_default_encoder_settings(tmp_path):
+    """resize/crop/rotate expose no effort parameter, so they take the defaults silently."""
+    src = tmp_path / "w.webp"
+    Image.new("RGB", (160, 120), (40, 90, 160)).save(src, "WEBP")
+    out = load(tools.image_resize(path=str(src), percent=50,
+                                  output_path=str(tmp_path / "half.webp")))
+    assert any("effort not given -> WebP method 2" in n for n in out["notes"]), out["notes"]

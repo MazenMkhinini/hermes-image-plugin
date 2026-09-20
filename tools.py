@@ -56,6 +56,13 @@ MAX_OUTPUT_BYTES = 200 * 1024 * 1024        # refuse to write more than 200 MB
 DEFAULT_QUALITY = 85                        # image_convert / image_optimize default
 GEOMETRY_QUALITY = 95                       # resize/crop/rotate re-encode quality for lossy targets
 
+# Encoder-effort defaults, measured against Pillow 12.3.0 (see the README's encoding-effort table).
+# Pillow's own fallbacks sit at the slow end of each range — WebP's saver defaults to method=4 and
+# AVIF's to speed=6 — and this plugin only reached those numbers when the caller asked for them.
+WEBP_DEFAULT_METHOD = 2                     # effort not given: several times faster than method=4
+WEBP_MAX_METHOD = 5                         # effort=9 stops here; method=6 is the slowest, ~0.2% smaller
+AVIF_DEFAULT_SPEED = 8                      # effort not given: Pillow's default is 6
+
 SAVE_FORMATS: Tuple[str, ...] = ("PNG", "JPEG", "WEBP", "TIFF", "GIF", "AVIF", "BMP")
 EXTENSIONS: Dict[str, str] = {
     "PNG": ".png", "JPEG": ".jpg", "WEBP": ".webp", "TIFF": ".tiff",
@@ -566,6 +573,15 @@ def _save_all_formats() -> set:
 
 def _effort_kwargs(fmt: str, effort: Any) -> Tuple[Dict[str, Any], List[str]]:
     if effort is None:
+        # Not asking for an effort is not a reason to inherit the encoder's slowest sane setting.
+        if fmt == "WEBP":
+            return {"method": WEBP_DEFAULT_METHOD}, [
+                f"effort not given -> WebP method {WEBP_DEFAULT_METHOD} (Pillow's own default is 4, "
+                f"which measures 1.6-2.0x slower at the same quality setting)"]
+        if fmt == "AVIF":
+            return {"speed": AVIF_DEFAULT_SPEED}, [
+                f"effort not given -> AVIF speed {AVIF_DEFAULT_SPEED} (Pillow's own default is 6; "
+                f"higher is faster and slightly larger)"]
         return {}, []
     if isinstance(effort, bool):
         raise ToolError(f"effort must be an integer 0-9, got {effort!r}", "pass effort between 0 and 9")
@@ -574,7 +590,7 @@ def _effort_kwargs(fmt: str, effort: Any) -> Tuple[Dict[str, Any], List[str]]:
     except (TypeError, ValueError):
         raise ToolError(f"effort must be an integer 0-9, got {effort!r}", "pass effort between 0 and 9")
     if fmt == "WEBP":
-        method = max(0, min(6, round(e * 6 / 9)))
+        method = max(0, min(WEBP_MAX_METHOD, round(e * 6 / 9)))
         return {"method": method}, [f"effort {e} -> WebP method {method}"]
     if fmt == "AVIF":
         speed = max(0, min(10, 10 - round(e * 10 / 9)))
@@ -855,8 +871,9 @@ def image_resize(**params: Any) -> str:
                     and tgt_w * tgt_h < src_w * src_h
                     and RESAMPLE_CHOICES[resample_key] != "NEAREST"):
                 try:
+                    full_size = im.size
                     im.draft(im.mode, (tgt_w, tgt_h))  # decode only as much as the target needs
-                    drafted = True
+                    drafted = im.size != full_size   # draft() is a no-op below a 2x reduction
                 except Exception:
                     pass
             _decode(im)   # decoded AFTER draft(), so draft() really does cut the decode
@@ -1178,7 +1195,11 @@ def image_convert(**params: Any) -> str:
                                                 params.get("overwrite", False),
                                                 params.get("confirm", False))
             alpha = _alpha_present(im)
-            frames, durations = _frames_of(im)
+            # Settle the frame count before materialising anything: a still target writes the first
+            # frame only, so decoding the other 59 of a 60-frame GIF would be work thrown away.
+            source_frames = _frame_count(im)
+            animate = fmt in _save_all_formats() and source_frames > 1
+            frames, durations = _frames_of(im, first_only=not animate)
             loop = im.info.get("loop", 0)
             notes: List[str] = []
             notes.extend(_format_notes(im, target, fmt))
@@ -1204,8 +1225,7 @@ def image_convert(**params: Any) -> str:
             if animate:
                 frames_written, frames_dropped = len(frames), 0
             else:
-                frames_written, frames_dropped = 1, len(frames) - 1
-                frames = frames[:1]
+                frames_written, frames_dropped = 1, max(0, source_frames - 1)
 
             extra: Dict[str, Any] = {}
             if animate:
@@ -1217,7 +1237,8 @@ def image_convert(**params: Any) -> str:
                              f"loop={loop}")
             elif frames_dropped:
                 notes.append(f"frames_dropped={frames_dropped} ({fmt} does not support multi-frame "
-                             f"images via Pillow's save_all in 12.3.0; the first frame was written)")
+                             f"images via Pillow's save_all in 12.3.0; the first frame was written and "
+                             f"the dropped frames were neither decoded nor validated)")
             orientation = im.getexif().get(_EXIF_ORIENTATION)
             dropped_meta: List[str] = []
 
@@ -1267,7 +1288,7 @@ def image_convert(**params: Any) -> str:
 
 def image_optimize(**params: Any) -> str:
     try:
-        im, src, src_bytes = _open_decoded(params.get("path"))
+        im, src, src_bytes = _open_source(params.get("path"))   # header-only: draft() needs the dimensions first
         try:
             before = _before(im, src_bytes)   # before frame iteration mutates im.mode
             if (im.format or "").upper() not in SAVE_FORMATS:
@@ -1283,21 +1304,37 @@ def image_optimize(**params: Any) -> str:
             notes.extend(_format_notes(im, target, fmt))
             strip = bool(params.get("strip_metadata", False))
             max_dimension = params.get("max_dimension")
-            frames, durations = _frames_of(im)
-            result_frames = frames
-            resized = False
+            limit: Optional[int] = None
+            tgt: Optional[Tuple[int, int]] = None
             if max_dimension is not None:
                 limit = _whole_int(max_dimension, "max_dimension")
                 longest = max(im.size)
                 if longest > limit:
                     scale = limit / float(longest)
-                    tgt = (max(1, int(round(im.size[0] * scale))), max(1, int(round(im.size[1] * scale))))
-                    result_frames = [f.resize(tgt, resample=Image.Resampling.LANCZOS) for f in frames]
-                    resized = True
-                    notes.append(f"max_dimension={limit}: resized {im.size[0]}x{im.size[1]} -> "
-                                 f"{result_frames[0].size[0]}x{result_frames[0].size[1]} (Lanczos)")
-                else:
-                    notes.append(f"max_dimension={limit}: source is already within the limit; not resized")
+                    tgt = (max(1, int(round(im.size[0] * scale))),
+                           max(1, int(round(im.size[1] * scale))))
+            drafted = False
+            if tgt is not None and fmt == "JPEG" and im.mode in ("RGB", "L"):
+                try:
+                    full_size = im.size
+                    im.draft(im.mode, tgt)   # decode only as much as the target needs
+                    drafted = im.size != full_size   # draft() is a no-op below a 2x reduction
+                except Exception:
+                    pass
+            _decode(im)   # decoded AFTER draft(), so draft() really does cut the decode
+            frames, durations = _frames_of(im)
+            result_frames = frames
+            resized = False
+            if tgt is not None:
+                result_frames = [f.resize(tgt, resample=Image.Resampling.LANCZOS) for f in frames]
+                resized = True
+                before_w, before_h = before["dimensions"]
+                notes.append(f"max_dimension={limit}: resized {before_w}x{before_h} -> "
+                             f"{result_frames[0].size[0]}x{result_frames[0].size[1]} (Lanczos)")
+            elif limit is not None:
+                notes.append(f"max_dimension={limit}: source is already within the limit; not resized")
+            if drafted:
+                notes.append("JPEG draft decode used: decoded at a reduced scale before resizing")
 
             result_frames, extra, frames_written, frames_dropped, frame_notes = _animation_extra(
                 fmt, result_frames, durations, im.info.get("loop", 0))
@@ -1324,6 +1361,14 @@ def image_optimize(**params: Any) -> str:
             if size > src_bytes:
                 notes.append(f"output is {size - src_bytes:,} bytes LARGER than the input "
                              f"({src_bytes:,}); lower quality or try another format")
+            elif size == src_bytes:
+                notes.append(f"re-encoded to exactly {size:,} bytes — nothing was saved, so this "
+                             f"format/effort combination only cost time; a lower effort would be "
+                             f"faster for the same result")
+            else:
+                saved = src_bytes - size
+                notes.append(f"re-encoded: {src_bytes:,} -> {size:,} bytes ({saved:,} saved, "
+                             f"{100.0 * saved / src_bytes:.1f}% smaller)")
             im.close()
             return _ok({"input": str(src), "output": str(target), "before": before,
                         "after": {k: v for k, v in after.items() if k != "path"},
@@ -1420,13 +1465,31 @@ def _animation_extra(fmt: str, frames: List[Any], durations: List[Optional[int]]
     return frames, {}, 1, dropped, notes
 
 
-def _frames_of(im: Any) -> Tuple[List[Any], List[Optional[int]]]:
+def _frame_count(im: Any) -> int:
+    """How many frames the source file holds (1 for a still image)."""
+    return max(1, int(getattr(im, "n_frames", 1) or 1))
+
+
+def _frames_of(im: Any, first_only: bool = False) -> Tuple[List[Any], List[Optional[int]]]:
+    """Copy the frames to write, plus one duration per frame returned.
+
+    ``first_only`` skips the frame walk entirely: a still target writes the first frame, so the
+    remaining frames are never decoded and ``frame_durations`` describes only what was written
+    (``frames_dropped`` still reports how many source frames that left behind).
+    """
     frames: List[Any] = []
     durations: List[Optional[int]] = []
     if int(getattr(im, "n_frames", 1) or 1) > 1:
-        for frame in ImageSequence.Iterator(im):
-            frames.append(frame.copy())
-            durations.append(frame.info.get("duration"))
+        if first_only:
+            # Take the first frame through Pillow's own iterator and stop: it seeks to the format's
+            # first frame (a multi-layer PSD starts at 1, not 0) and the walk itself is the cost, so
+            # iterating one step avoids it without assuming frame 0 exists.
+            frames.append(next(iter(ImageSequence.Iterator(im))).copy())
+            durations.append(im.info.get("duration"))
+        else:
+            for frame in ImageSequence.Iterator(im):
+                frames.append(frame.copy())
+                durations.append(frame.info.get("duration"))
     else:
         frames.append(im.copy())
         durations.append(im.info.get("duration"))

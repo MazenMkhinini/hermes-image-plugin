@@ -12,6 +12,11 @@ dependency rather than something this plugin installs, so it is deliberately *no
 `plugin.yaml` (no `python_dependencies` key). Without it, `image_info` still answers and reports
 `pillow_available: false`, while the other five tools refuse with a `how_to_fix`.
 
+## AI-generated code
+
+The code in this repository was written with AI assistance, then reviewed and tested before
+publication.
+
 ## What it gives the agent
 
 | Tool | Type | Notes |
@@ -20,8 +25,8 @@ dependency rather than something this plugin installs, so it is deliberately *no
 | `image_resize` | write | `width` / `height` / `percent` (exactly one; both width+height needs `allow_distort=true`), aspect preserved, Lanczos, **never upscales** unless `allow_upscale=true`. A JPEG downscale calls `draft()` *before* decoding, so the JPEG is decoded at the reduced scale; the target size is capped like an input (50 MP). Animated input keeps every frame. |
 | `image_crop` | write | `box=[left, top, right, bottom]` (validated against the image bounds — out-of-range is refused, Pillow would silently pad black), or `aspect="16:9"` / `"1:1"` (largest centred rectangle), or centred `width`/`height`. Animated input keeps every frame. |
 | `image_rotate` | write | 90/180/270 by exact `transpose()`; other angles expand the canvas (`bicubic`, background-coloured corners, transparent for alpha; the fill is shaped per mode and a palette-transparent P image is rotated as RGBA so its transparency survives). `auto_orient=true` (default) applies the EXIF orientation first, and the written file gets the orientation tag cleared (written as 1) where the target can carry EXIF — GIF/BMP say so in `notes` instead. Omit `angle` to only fix orientation. Animated input keeps every frame. |
-| `image_convert` | write | PNG/JPEG/WebP/TIFF/GIF/AVIF/BMP. Alpha → JPEG/BMP/GIF requires `flatten=true` (composited onto `background`, default white) instead of silently dropping transparency. Animated inputs write all frames where the target supports it (GIF/WebP/AVIF/TIFF/PNG), else the first frame with `frames_dropped` reported. |
-| `image_optimize` | write | re-encode in the input's own format: `quality`, `effort` (0–9, mapped per format and reported), optional `max_dimension` (Lanczos, never upscales), `strip_metadata` (default false and stated in the response). Animated input keeps every frame, including an in-place re-encode. |
+| `image_convert` | write | PNG/JPEG/WebP/TIFF/GIF/AVIF/BMP. Alpha → JPEG/BMP/GIF requires `flatten=true` (composited onto `background`, default white) instead of silently dropping transparency. Animated inputs write all frames where the target supports it (GIF/WebP/AVIF/TIFF/PNG), else the first frame alone: `frames_dropped` reports the rest and `frame_durations` describes only the frames that were written, because the others are never decoded. |
+| `image_optimize` | write | re-encode in the input's own format: `quality`, `effort` (0–9, mapped per format and reported), optional `max_dimension` (Lanczos, never upscales), `strip_metadata` (default false and stated in the response). Animated input keeps every frame, including an in-place re-encode. A `max_dimension` JPEG downscale calls `draft()` before decoding, like `image_resize`. Every response states the size outcome: bytes saved, nothing saved, or larger than the input. |
 
 Every write returns `{input, output, before, after, replaced, frames_written, frames_dropped,
 notes}`; `before` comes from the header stage and `after` is read back **from the file on disk**, so
@@ -59,6 +64,14 @@ the envelope describes the bytes that actually landed. Every refusal returns
   Hermes runs tool calls in worker threads. A 200 MP header-only PNG **and** a 96–178 MP one (the
   band where Pillow only *warns*) are both refused with a `how_to_fix` — never a traceback, never a
   warning handed back to the model.
+- **Only the frames that are written are decoded.** A still target reads the first frame and stops;
+  the rest are neither decoded nor validated, which is what turns a 60-frame animation into a ~26 ms
+  conversion instead of ~200 ms. A damaged frame *after* the first is therefore not detected, and the
+  response says so ("the dropped frames were neither decoded nor validated"). An animated target still
+  walks every frame, so it still refuses a truncated file.
+- **Header-stage checks run before the pixel decode.** The output path is resolved, gated and
+  `max_dimension` validated before the pixels are read, so a corrupt file whose output path is already
+  taken is reported as the path collision first; reading the pixels is what reports the corruption.
 - **Memory.** A decoded image costs ≈ width × height × channels bytes (a 50 MP RGB image ≈ 150 MB),
   and a resize holds the source plus the result — budget ~3× the decoded size transiently. The caps
   are sized against that budget, not against the file size on disk: 100 MP summed over frames is
@@ -161,3 +174,29 @@ No state outside the files it writes; the plugin keeps no cache, no database and
 - GIF frame surgery, drawing/text/watermarks, batch runs and colour correction are out of scope.
 - `image_resize` re-encodes lossy targets at quality 95 unless the format is lossless; the note in
   the response says which quality was applied.
+- Encoder defaults are picked for time, not inherited from Pillow. With no `effort`, WebP is written
+  at `method=2` (Pillow's saver default is 4) and AVIF at `speed=8` (Pillow's default is 6), and the
+  `notes` name the setting used. `effort=9` maps to WebP `method=5`, not 6: the last step is the
+  slowest of the range for the smallest return. **To get the old behaviour back: `effort=4` selects
+  AVIF `speed=6`, `effort=6` selects WebP `method=4`.** These defaults apply to *every* write tool,
+  not only `image_convert` and `image_optimize`: `image_resize`, `image_crop` and `image_rotate` take
+  no `effort` parameter, so they always use them.
+- What the defaults cost and buy, measured (median of 3, interleaved before/after, a fresh process per
+  run, one machine) on non-noise 12 MP fixtures — a smooth photo-like image and a flat block pattern:
+
+  | case | before | after | speed | output bytes |
+  |---|---|---|---|---|
+  | WebP, photo-like | 556 ms | 282 ms | 1.97x | **+9.9%** |
+  | WebP, flat pattern | 537 ms | 317 ms | 1.69x | **+17.6%** |
+  | AVIF, photo-like | 412 ms | 237 ms | 1.74x | +2.2% |
+  | AVIF, flat pattern | 715 ms | 293 ms | 2.44x | **+271%** |
+  | `max_dimension=1600`, 12 MP JPEG | 144 ms | 64 ms | 2.24x | +0.02% |
+  | 60-frame GIF -> JPEG, photo-like | 200 ms | 26 ms | 7.7x | identical |
+  | 60-frame GIF -> JPEG, screen-capture-like | 99 ms | 25 ms | 4.0x | identical |
+  | 2-frame GIF -> JPEG | 28 ms | 25 ms | 1.1x | identical |
+
+  Read the byte column as a real cost, not a rounding error. A fast AVIF speed is worst exactly where
+  the input compresses well: a flat 44 KB PNG became a 46 KB AVIF above, and the response warns
+  whenever the output is larger than the input. The frame-walk saving scales with frame count and
+  per-frame entropy — a 2-frame GIF gains almost nothing while a 60-frame one gains 4-8x — and its
+  output is byte-identical in every case measured. Pass `effort` when bytes matter more than time.
