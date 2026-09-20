@@ -301,11 +301,15 @@ def test_in_place_publish_releases_the_source_handle(tmp_path, monkeypatch, tool
     # control half: neutered release -> the handle must be visible, or this test is blind
     monkeypatch.setattr(tools, "_release_input", lambda *a, **k: None)
     control = load(getattr(tools, tool)(**in_place_kwargs(tool, src, fmt), overwrite=True, confirm=True))
-    assert "error" not in control, control
-    assert control["replaced"] is True
-    assert open_at_publish and open_at_publish[-1], (
-        f"{tool}/{fmt}: nothing was open even with the release disabled — this test cannot see "
-        f"the bug it claims to catch")
+    if "error" in control:
+        # Windows enforces the invariant in the OS: with no release the rename is refused outright.
+        # That refusal is the bug seen directly, so it counts as the control firing.
+        assert "WinError 5" in str(control["error"]) or "PermissionError" in str(control["error"]), control
+    else:
+        assert control.get("replaced") is True, control
+        assert open_at_publish and open_at_publish[-1], (
+            f"{tool}/{fmt}: nothing was open even with the release disabled — this test cannot see "
+            f"the bug it claims to catch")
 
     # assertion half: the real code publishes with nothing left open on the target
     monkeypatch.setattr(tools, "_release_input", real_release)
@@ -348,6 +352,25 @@ def test_release_input_closes_the_image_and_its_mapping(tmp_path):
         mapping.read(1)   # a closed mmap refuses to read
 
 
+def test_make_writable_for_replace_is_windows_only(tmp_path):
+    """The read-only escape hatch runs on Windows and leaves POSIX modes alone.
+
+    Windows refuses to replace a read-only file (WinError 5); POSIX does not care, and clearing a
+    bit there would be a permission change nobody asked for. The platform is a parameter, so the
+    branch that only CI could otherwise reach is exercised here.
+    """
+    path = tmp_path / "ro.bin"
+    path.write_bytes(b"x")
+    os.chmod(path, 0o444)
+
+    assert tools._make_writable_for_replace(path, platform="posix") is False
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o444, "a POSIX mode was changed"
+
+    assert tools._make_writable_for_replace(path, platform="nt") is True
+    assert stat.S_IMODE(os.stat(path).st_mode) & stat.S_IWRITE, "the file is still not writable"
+    os.chmod(path, 0o644)
+
+
 def test_the_output_mode_is_applied_after_the_publish(tmp_path, monkeypatch):
     """The mode is restored *after* the rename, never written onto the temp file before it.
 
@@ -380,9 +403,11 @@ def test_the_output_mode_is_applied_after_the_publish(tmp_path, monkeypatch):
     kinds = [kind for kind, _ in events]
     assert "publish" in kinds, "the write never published"
     published_at = kinds.index("publish")
-    assert not [e for e in events[:published_at] if e[0] == "chmod"], (
-        "something was chmod'ed before the rename — Windows refuses that when the target is "
-        "read-only, which is the same WinError 5 this branch exists to avoid")
+    temp_chmods = [p for kind, p in events[:published_at]
+                   if kind == "chmod" and Path(p).suffix == ".tmp"]
+    assert not temp_chmods, (
+        f"the temp file was chmod'ed before the rename ({temp_chmods}) — a read-only temp file is "
+        f"the same WinError 5 this branch exists to avoid")
     assert any(kind == "chmod" and path == os.path.realpath(src)
                for kind, path in events[published_at:]), "the target's mode was never restored"
     if os.name != "nt":

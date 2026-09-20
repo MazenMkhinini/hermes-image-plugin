@@ -492,6 +492,22 @@ def _publish_with_retry(publish: Callable[[], None]) -> None:
             time.sleep(0.05 * (attempt + 1))
 
 
+def _make_writable_for_replace(target: Path, platform: str = os.name) -> bool:
+    """Clear the read-only attribute that stops a Windows rename; report whether it was cleared.
+
+    Windows refuses to replace a read-only file (``os.replace`` -> WinError 5). POSIX has no such
+    rule — the directory's permissions decide — so nothing happens there and modes are left alone.
+    ``platform`` is a parameter so the Windows branch is testable on a POSIX box.
+    """
+    if platform != "nt":
+        return False
+    try:
+        os.chmod(target, stat.S_IWRITE)
+        return True
+    except OSError:
+        return False
+
+
 def _release_input(image: Any) -> None:
     """Release the input's read handle, so its file can be replaced.
 
@@ -571,11 +587,20 @@ def _write_atomic(target: Path, writer: Callable[[Any], None], overwrite: bool, 
                 # refuses a rename over a file that still has one open, POSIX allows it. The encoded
                 # bytes are verified by now, so nothing needs the input any more.
                 release()
-            _publish_with_retry(_publish)
+            # A read-only target stops the rename on Windows, so it is made writable for it and
+            # put back either way — a failed publish must not leave the user's file writable.
+            cleared_read_only = _make_writable_for_replace(target) if (overwrite and confirm) else False
             try:
-                # After the rename, not on the temp file before it: Windows denies replacing a
-                # read-only file (the same WinError 5 signature), and the temp file's own mode is
-                # narrower (0600) than the 0644 a fresh output would get.
+                _publish_with_retry(_publish)
+            except Exception:
+                if cleared_read_only:
+                    with contextlib.suppress(OSError):
+                        os.chmod(target, mode)
+                raise
+            try:
+                # After the rename, not on the temp file before it: a read-only temp file is the
+                # other half of the same WinError 5, and the temp's own mode (0600) is narrower than
+                # the 0644 a fresh output would get.
                 os.chmod(target, mode)
             except OSError:
                 pass
