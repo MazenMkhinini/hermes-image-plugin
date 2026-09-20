@@ -1,0 +1,17 @@
+name: image-utils
+version: "1.0.0"
+manifest_version: 2
+kind: standalone
+description: "Local image-file tools (info, resize, crop, rotate, convert, optimize) using Pillow in-process — no shell, no network."
+author: "MazenMkhinini"
+homepage: "https://github.com/MazenMkhinini/hermes-image-plugin"
+license: MIT
+tags: [images, pillow, files, photos]
+provides_tools:
+  - image_info
+  - image_resize
+  - image_crop
+  - image_rotate
+  - image_convert
+  - image_optimize
+provides_hooks: []
