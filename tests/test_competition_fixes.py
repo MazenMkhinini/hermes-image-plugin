@@ -352,6 +352,38 @@ def test_release_input_closes_the_image_and_its_mapping(tmp_path):
         mapping.read(1)   # a closed mmap refuses to read
 
 
+def test_a_failed_publish_still_restores_the_mode(tmp_path, monkeypatch):
+    """A publish that fails must not leave behind a file the read-only escape hatch made writable.
+
+    That branch only runs where the read-only attribute was cleared (Windows), so the clearing is
+    simulated here — but the *failure path itself* is what this exercises. An except clause no test
+    can reach is where a NameError hides, and one did: this path shipped referring to contextlib,
+    which tools.py never imports, and only the Windows job ever ran it.
+    """
+    src = helpers.make_noise_jpeg(tmp_path / "ro.jpg", size=(40, 40))
+    os.chmod(src, 0o444)
+
+    def fake_clear(path):
+        os.chmod(path, stat.S_IWRITE)   # what the Windows branch does to the target
+        return True
+
+    monkeypatch.setattr(tools, "_make_writable_for_replace", fake_clear)
+    monkeypatch.setattr(tools.time, "sleep", lambda *_: None)
+
+    def broken(source, destination):
+        raise OSError("synthetic publish failure")
+
+    monkeypatch.setattr(tools.os, "replace", broken)
+
+    out = load(tools.image_optimize(path=str(src), output_path=str(src), overwrite=True, confirm=True))
+    assert "error" in out, out
+    assert "synthetic publish failure" in out["error"], (
+        f"the real failure was masked: {out['error']}")
+    if os.name != "nt":
+        assert stat.S_IMODE(os.stat(src).st_mode) == 0o444, "the write left the file writable"
+    os.chmod(src, 0o644)
+
+
 def test_make_writable_for_replace_is_windows_only(tmp_path):
     """The read-only escape hatch runs on Windows and leaves POSIX modes alone.
 

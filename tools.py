@@ -594,8 +594,10 @@ def _write_atomic(target: Path, writer: Callable[[Any], None], overwrite: bool, 
                 _publish_with_retry(_publish)
             except Exception:
                 if cleared_read_only:
-                    with contextlib.suppress(OSError):
-                        os.chmod(target, mode)
+                    try:
+                        os.chmod(target, mode)   # a failed write must not leave the file writable
+                    except OSError:
+                        pass
                 raise
             try:
                 # After the rename, not on the temp file before it: a read-only temp file is the
