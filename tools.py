@@ -15,8 +15,9 @@ Safety contract:
 - Writes never overwrite by default: a new path, or ``overwrite=true`` *and* ``confirm=true``.
 - Writes are atomic: temp file in the target's directory, fsync, output-cap check, a re-read check of
   the encoded bytes, then an exclusive publish (``os.link`` with an O_EXCL fallback, unless
-  ``overwrite=true`` *and* ``confirm=true`` asked for a replace); the temp file is removed on every
-  failure path.
+  ``overwrite=true`` *and* ``confirm=true`` asked for a replace); the input's read handles are
+  released before the publish, because Windows refuses to replace a file that still has one open;
+  the temp file is removed on every failure path.
 - Every write reports before -> after (dimensions, format, mode, bytes) and the output path.
 - Metadata is carried by presence (never ``.get()``-with-``None``, which crashes the savers);
   ``image_rotate`` always clears the EXIF orientation tag because it changes pixel orientation.
@@ -32,6 +33,7 @@ import shutil
 import stat
 import tempfile
 import threading
+import time
 import warnings
 from contextlib import contextmanager
 from pathlib import Path
@@ -439,8 +441,8 @@ def _verify_encoded(tmp: Path, expect: Optional[Dict[str, Any]]) -> None:
         raise ToolError(
             f"the encoder wrote {size[0]}x{size[1]} but the tool reported "
             f"{int(want_size[0])}x{int(want_size[1])}; nothing was written",
-            "this is a plugin bug, not your input — try another target format and report it",
-        )
+                "this is a plugin bug, not your input — try another target format and report it",
+            )
     want_frames = expect.get("frames")
     if want_frames is not None and frames != max(1, int(want_frames)):
         raise ToolError(
@@ -456,8 +458,59 @@ def _verify_encoded(tmp: Path, expect: Optional[Dict[str, Any]]) -> None:
         )
 
 
+_WINDOWS_RETRY_WINERRORS = (5, 32)   # ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION
+_PUBLISH_ATTEMPTS = 4
+
+
+def _publish_with_retry(publish: Callable[[], None]) -> None:
+    """Publish, retrying briefly on the Windows errors an external holder causes.
+
+    An antivirus scanner, the search indexer or a sync client can hold the target at the instant of
+    the rename, which Windows reports as WinError 5 or 32 even when nothing in this process still
+    has the file open. Nothing in-process can prevent that, so the rename is retried a few times
+    with a short backoff before the failure is reported. POSIX raises no ``winerror`` and is never
+    retried — its permission failures are real.
+    """
+    for attempt in range(_PUBLISH_ATTEMPTS):
+        try:
+            publish()
+            return
+        except OSError as exc:
+            transient = getattr(exc, "winerror", None) in _WINDOWS_RETRY_WINERRORS
+            if not transient or attempt == _PUBLISH_ATTEMPTS - 1:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
+def _release_input(image: Any) -> None:
+    """Release the input's read handle, so its file can be replaced.
+
+    Windows refuses to replace a file that still has an open handle (``os.replace`` fails with
+    WinError 5); POSIX allows it, so an in-place write only ever broke there. Two things have to go:
+
+    - the file handle: Pillow keeps it in ``ImageFile._fp`` (the public ``fp`` is already ``None``
+      once ``load()`` has run), and ``Image.close()`` is what releases it;
+    - the mapping: for single-strip BMP/TIFF/PNG/P inputs Pillow maps the file instead of reading it
+      (``ImageFile`` only mmaps when the mode is in ``_MAPMODES``), and ``close()`` merely drops
+      ``self.map`` — it closes the mapping itself only under win32 + PyPy — so a live mapping would
+      otherwise survive until the garbage collector happens to run, which is exactly the kind of
+      timing a rename cannot rely on.
+    """
+    mapping = getattr(image, "map", None)   # read before close(): close() clears the attribute
+    try:
+        image.close()
+    except Exception:
+        pass
+    if mapping is not None and hasattr(mapping, "close"):
+        try:
+            mapping.close()
+        except Exception:
+            pass
+
+
 def _write_atomic(target: Path, writer: Callable[[Any], None], overwrite: bool, confirm: bool,
-                  expect: Optional[Dict[str, Any]] = None) -> int:
+                  expect: Optional[Dict[str, Any]] = None,
+                  release: Optional[Callable[[], None]] = None) -> int:
     """Encode into a same-directory temp file, verify it, then publish it."""
     parent = target.parent
     try:
@@ -485,20 +538,37 @@ def _write_atomic(target: Path, writer: Callable[[Any], None], overwrite: bool, 
             )
         _verify_encoded(tmp, expect)
         try:
-            mode = stat.S_IMODE(os.stat(target).st_mode)
-        except OSError:
+            mode = stat.S_IMODE(os.stat(target).st_mode)   # read before the replace: afterwards the
+        except OSError:                                    # target carries the temp file's mode
             mode = 0o644
-        try:
-            os.chmod(tmp, mode)   # preserve the mode of the file being replaced, where one exists
-        except OSError:
-            pass
-        if overwrite and confirm:
-            os.replace(tmp, target)          # the caller explicitly asked to replace the target
-        else:
+
+        def _publish() -> None:
+            if overwrite and confirm:
+                os.replace(tmp, target)      # the caller explicitly asked to replace the target
+                return
             if target.exists():
                 raise ToolError(f"output appeared while writing (concurrent write?): {target}",
                                 "retry, or pass overwrite=true and confirm=true to replace it")
             _publish_exclusive(tmp, target)
+
+        # Releasing, renaming and restoring the mode are one critical section: between them the
+        # target must not be opened again. Hermes runs tool calls in worker threads, and on Windows
+        # an open handle anywhere turns the rename into WinError 5. _GUARD_LOCK is the lock that
+        # already serialises _guarded(), and it is re-entrant.
+        with _GUARD_LOCK:
+            if release is not None:
+                # The input's handle has to be gone before its own file can be replaced: Windows
+                # refuses a rename over a file that still has one open, POSIX allows it. The encoded
+                # bytes are verified by now, so nothing needs the input any more.
+                release()
+            _publish_with_retry(_publish)
+            try:
+                # After the rename, not on the temp file before it: Windows denies replacing a
+                # read-only file (the same WinError 5 signature), and the temp file's own mode is
+                # narrower (0600) than the 0644 a fresh output would get.
+                os.chmod(target, mode)
+            except OSError:
+                pass
         return size                          # the finally unlinks the temp name (a no-op after replace)
     finally:
         if tmp is not None:
@@ -894,7 +964,8 @@ def image_resize(**params: Any) -> str:
                 notes.append("metadata dropped by target format: " + ", ".join(sorted(set(dropped))))
             size = _write_atomic(target, lambda fh: result_frames[0].save(fh, format=fmt, **kwargs),
                                  bool(params.get("overwrite")), bool(params.get("confirm")),
-                                 expect={"size": result_frames[0].size, "frames": frames_written})
+                                 expect={"size": result_frames[0].size, "frames": frames_written},
+                                 release=lambda: _release_input(im))
             after = _after_from_disk(target, size, fmt)
             notes.append(_orientation_note(im, "resize"))
             im.close()
@@ -1021,7 +1092,8 @@ def image_crop(**params: Any) -> str:
 
             size = _write_atomic(target, _write_crop,
                                  bool(params.get("overwrite")), bool(params.get("confirm")),
-                                 expect={"size": result_frames[0].size, "frames": frames_written})
+                                 expect={"size": result_frames[0].size, "frames": frames_written},
+                                 release=lambda: _release_input(im))
             after = _after_from_disk(target, size, fmt)
             notes = [f"box=({left}, {top}, {right}, {bottom})",
                      _orientation_note(im, "crop")]
@@ -1151,7 +1223,8 @@ def image_rotate(**params: Any) -> str:
                 notes.append("metadata dropped by target format: " + ", ".join(sorted(set(dropped))))
             size = _write_atomic(target, lambda fh: result_frames[0].save(fh, format=fmt, **kwargs),
                                  bool(params.get("overwrite")), bool(params.get("confirm")),
-                                 expect={"size": result_frames[0].size, "frames": frames_written})
+                                 expect={"size": result_frames[0].size, "frames": frames_written},
+                                 release=lambda: _release_input(im))
             after = _after_from_disk(target, size, fmt)
             tag_cleared = fmt in FORMAT_METADATA_SUPPORT["exif"]
             notes.append("orientation tag cleared (written as 1)" if tag_cleared
@@ -1254,7 +1327,8 @@ def image_convert(**params: Any) -> str:
             size = _write_atomic(target, _write, bool(params.get("overwrite")),
                                  bool(params.get("confirm")),
                                  expect={"size": frames[0].size, "frames": frames_written,
-                                         "strip": bool(params.get("strip_metadata", False))})
+                                         "strip": bool(params.get("strip_metadata", False))},
+                                 release=lambda: _release_input(im))
             if dropped_meta:
                 notes.append("metadata dropped by target format: " + ", ".join(sorted(set(dropped_meta))))
             if orientation not in (None, 1) and "exif" in dropped_meta:
@@ -1356,7 +1430,8 @@ def image_optimize(**params: Any) -> str:
             size = _write_atomic(target, _write, bool(params.get("overwrite")),
                                  bool(params.get("confirm")),
                                  expect={"size": result_frames[0].size, "frames": frames_written,
-                                         "strip": strip})
+                                         "strip": strip},
+                                 release=lambda: _release_input(im))
             after = _after_from_disk(target, size, fmt)
             if size > src_bytes:
                 notes.append(f"output is {size - src_bytes:,} bytes LARGER than the input "

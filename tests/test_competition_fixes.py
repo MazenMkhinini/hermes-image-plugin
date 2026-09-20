@@ -10,8 +10,12 @@ observable: the JSON envelope, the bytes on disk, the leftover temp files.
 
 from __future__ import annotations
 
+import gc
+import io
 import json
+import mmap
 import os
+import stat
 import sys
 import threading
 import time
@@ -198,6 +202,274 @@ def test_in_place_optimize_never_replaces_an_animation_with_a_still(tmp_path):
     assert result["replaced"] is True
     assert frames_on_disk(src) == 3
     no_temps(tmp_path)
+
+
+IN_PLACE_TOOLS = ("image_resize", "image_crop", "image_rotate", "image_optimize", "image_convert")
+
+
+def in_place_kwargs(tool: str, path: Path, fmt: str) -> dict:
+    """An in-place write: output_path is the input, with the flags the tools demand for that."""
+    kwargs = {"path": str(path), "output_path": str(path)}
+    if tool == "image_resize":
+        kwargs["percent"] = 50
+    elif tool == "image_crop":
+        kwargs["box"] = [0, 0, 20, 20]
+    elif tool == "image_rotate":
+        kwargs["angle"] = 90
+    elif tool == "image_convert":
+        kwargs["format"] = fmt
+    return kwargs
+
+
+def make_multiframe(path: Path, fmt: str) -> Path:
+    """A lazily-read source: Pillow keeps the read handle until the last frame is out."""
+    if fmt == "gif":
+        return helpers.make_animated_gif(path, frames=3, size=(40, 40))
+    frames = [Image.new("L", (40, 40), level) for level in (10, 120, 240)]
+    frames[0].save(path, save_all=True, append_images=frames[1:])
+    return path
+
+
+def handles_open_on(path) -> list:
+    """Everything in this process still holding that path: open files and live mappings.
+
+    Both block a Windows rename, and a mapping is not an ``io.IOBase``, so the GC walk covers the
+    mapping through the image that owns it (``mmap`` exposes no path of its own).
+    """
+    want = os.path.realpath(path)
+    found = []
+    gc.collect()
+    for obj in gc.get_objects():
+        try:
+            if isinstance(obj, io.IOBase):
+                if not obj.closed and obj.fileno() >= 0:
+                    name = getattr(obj, "name", None)
+                    if isinstance(name, (str, os.PathLike)) and os.path.realpath(name) == want:
+                        found.append(f"{type(obj).__name__}({name})")
+            elif isinstance(obj, mmap.mmap) and not obj.closed:
+                for owner in gc.get_referrers(obj):
+                    name = getattr(owner, "filename", None)
+                    if isinstance(name, (str, os.PathLike)) and os.path.realpath(name) == want:
+                        found.append(f"mmap held by {type(owner).__name__}")
+                        break
+        except (ValueError, OSError, AttributeError):
+            continue
+    return found
+
+
+def test_the_handle_detector_sees_a_handle_it_should_see(tmp_path):
+    """The detector itself, pinned: a blind detector would make every assertion below vacuous."""
+    src = make_multiframe(tmp_path / "c.gif", "gif")
+    assert handles_open_on(src) == []
+    probe = open(src, "rb")
+    try:
+        assert handles_open_on(src), "the detector missed a handle this test opened itself"
+    finally:
+        probe.close()
+    assert handles_open_on(src) == []
+
+
+@pytest.mark.parametrize("fmt", ["gif", "tiff"])
+@pytest.mark.parametrize("tool", IN_PLACE_TOOLS)
+def test_in_place_publish_releases_the_source_handle(tmp_path, monkeypatch, tool, fmt):
+    """No handle may still be open on the target when it is replaced in place — for every tool.
+
+    Windows refuses to replace a file that still has an open handle (WinError 5); POSIX allows it,
+    so on Linux the bug is invisible and only the Windows job in CI sees it. The check runs against
+    every in-place call site, on a GIF (a lazily-read handle) and a TIFF (which Pillow maps).
+
+    It validates its own instrument first: with the release neutered the handle MUST show up. Without
+    that control, "nothing is open" cannot be told apart from a blind detector or a spy watching the
+    wrong path, and the assertions would pass for the wrong reason.
+    """
+    src = make_multiframe(tmp_path / f"{tool}_{fmt}.{'gif' if fmt == 'gif' else 'tif'}", fmt)
+    assert handles_open_on(src) == [], "the fixture itself holds a handle"
+
+    open_at_publish: list = []
+    real_replace = os.replace
+
+    def spy_replace(source, destination):
+        assert os.path.realpath(destination) == os.path.realpath(src), (
+            f"{tool}: the publish spy saw {destination}, expected {src} — it is watching the "
+            f"wrong path and would pass regardless")
+        open_at_publish.append(handles_open_on(destination))
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(tools.os, "replace", spy_replace)
+    real_release = tools._release_input
+
+    # control half: neutered release -> the handle must be visible, or this test is blind
+    monkeypatch.setattr(tools, "_release_input", lambda *a, **k: None)
+    control = load(getattr(tools, tool)(**in_place_kwargs(tool, src, fmt), overwrite=True, confirm=True))
+    assert "error" not in control, control
+    assert control["replaced"] is True
+    assert open_at_publish and open_at_publish[-1], (
+        f"{tool}/{fmt}: nothing was open even with the release disabled — this test cannot see "
+        f"the bug it claims to catch")
+
+    # assertion half: the real code publishes with nothing left open on the target
+    monkeypatch.setattr(tools, "_release_input", real_release)
+    open_at_publish.clear()
+    result = load(getattr(tools, tool)(**in_place_kwargs(tool, src, fmt), overwrite=True, confirm=True))
+    assert "error" not in result, result
+    assert result["replaced"] is True
+    assert open_at_publish, f"{tool}: the in-place write never published through os.replace"
+    assert not open_at_publish[-1], (
+        f"{tool}/{fmt}: handle(s) still open on the target when it was replaced: "
+        f"{open_at_publish[-1]} — Windows refuses this with WinError 5")
+    assert frames_on_disk(src) == 3
+    no_temps(tmp_path)
+
+
+def test_release_input_closes_the_image_and_its_mapping(tmp_path):
+    """The release contract, pinned directly: the mapping goes too, not just the file handle.
+
+    ``Image.close()`` only drops ``self.map`` (it closes the mapping itself under win32 + PyPy
+    alone), so relying on it would leave the unmapping to the garbage collector — timing a rename
+    cannot depend on.
+    """
+    path = tmp_path / "mapped.bin"
+    path.write_bytes(b"0123456789abcdef")
+
+    class Mapped:
+        def __init__(self, mapping):
+            self.map = mapping
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    with open(path, "rb") as handle:
+        mapping = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+    holder = Mapped(mapping)
+    tools._release_input(holder)
+    assert holder.closed, "the image itself was left open"
+    with pytest.raises(ValueError):
+        mapping.read(1)   # a closed mmap refuses to read
+
+
+def test_the_output_mode_is_applied_after_the_publish(tmp_path, monkeypatch):
+    """The mode is restored *after* the rename, never written onto the temp file before it.
+
+    Windows denies replacing a read-only file (WinError 5 — the same signature as the bug this
+    branch fixes), so chmod'ing the temp file to the target's mode first breaks in-place writes on a
+    read-only input. The ordering is the fix, so the ordering is what this pins.
+    """
+    src = helpers.make_noise_jpeg(tmp_path / "ro.jpg", size=(60, 60))
+    real_chmod = os.chmod
+    os.chmod(src, 0o444)
+
+    events: list = []
+    real_replace = os.replace
+
+    def spy_replace(source, destination):
+        events.append(("publish", os.path.realpath(destination)))
+        return real_replace(source, destination)
+
+    def spy_chmod(path, mode, *args, **kwargs):
+        events.append(("chmod", os.path.realpath(path)))
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(tools.os, "replace", spy_replace)
+    monkeypatch.setattr(tools.os, "chmod", spy_chmod)
+
+    out = load(tools.image_optimize(path=str(src), output_path=str(src), overwrite=True, confirm=True))
+    assert "error" not in out, out
+    assert out["replaced"] is True
+
+    kinds = [kind for kind, _ in events]
+    assert "publish" in kinds, "the write never published"
+    published_at = kinds.index("publish")
+    assert not [e for e in events[:published_at] if e[0] == "chmod"], (
+        "something was chmod'ed before the rename — Windows refuses that when the target is "
+        "read-only, which is the same WinError 5 this branch exists to avoid")
+    assert any(kind == "chmod" and path == os.path.realpath(src)
+               for kind, path in events[published_at:]), "the target's mode was never restored"
+    if os.name != "nt":
+        assert stat.S_IMODE(os.stat(src).st_mode) == 0o444, "the mode was not preserved"
+    real_chmod(src, 0o644)
+
+
+def test_the_publish_runs_while_the_guard_lock_is_held(tmp_path, monkeypatch):
+    """Release -> rename -> chmod is one critical section; a worker thread must not slip inside it.
+
+    Hermes runs tool calls in worker threads, so another call could open the target in that window —
+    and on Windows an open handle at rename time is WinError 5 all over again.
+    """
+    src = make_multiframe(tmp_path / "locked.gif", "gif")
+    witnessed: list = []
+    real_replace = os.replace
+
+    def spy_replace(source, destination):
+        result: list = []
+
+        def probe():
+            acquired = tools._GUARD_LOCK.acquire(blocking=False)
+            result.append(acquired)
+            if acquired:
+                tools._GUARD_LOCK.release()
+
+        worker = threading.Thread(target=probe)
+        worker.start()
+        worker.join()
+        witnessed.append(result[0])
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(tools.os, "replace", spy_replace)
+
+    out = load(tools.image_optimize(path=str(src), output_path=str(src), overwrite=True, confirm=True))
+    assert "error" not in out, out
+    assert witnessed, "the write never published"
+    assert not any(witnessed), (
+        "another thread could acquire the guard lock while the target was being published — that is "
+        "the window a Windows rename cannot survive")
+
+
+def test_transient_windows_publish_errors_are_retried_and_real_ones_are_not(tmp_path, monkeypatch):
+    """WinError 5/32 is retried (an AV scanner or indexer holding the target); anything else is not.
+
+    No in-process fix can stop an external holder, so those two codes get a short backoff; a genuine
+    failure must still surface immediately rather than being papered over by retries.
+    """
+    src = make_multiframe(tmp_path / "flaky.gif", "gif")
+    monkeypatch.setattr(tools.time, "sleep", lambda *_: None)
+    real_replace = os.replace
+
+    def winerror(code: int) -> OSError:
+        exc = OSError(f"synthetic error {code}")
+        exc.winerror = code
+        return exc
+
+    # two sharing violations, then success
+    transient_calls: list = []
+    left = {"n": 2}
+
+    def flaky(source, destination):
+        transient_calls.append(1)
+        if left["n"]:
+            left["n"] -= 1
+            raise winerror(32)
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(tools.os, "replace", flaky)
+    out = load(tools.image_optimize(path=str(src), output_path=str(src), overwrite=True, confirm=True))
+    assert "error" not in out, out
+    assert len(transient_calls) == 3, f"expected 2 retries before success, saw {len(transient_calls)}"
+
+    # and a non-transient error is reported on the first attempt
+    permanent_calls: list = []
+
+    def permanent(source, destination):
+        permanent_calls.append(1)
+        raise winerror(2)
+
+    monkeypatch.setattr(tools.os, "replace", permanent)
+    failed = load(tools.image_optimize(path=str(src), output_path=str(src), overwrite=True, confirm=True))
+    assert "error" in failed, "a real publish failure was swallowed"
+    assert len(permanent_calls) == 1, f"a non-transient error was retried {len(permanent_calls)} times"
+
+
+# --------------------------------------------------------------- arbitrary-angle rotate, all modes
 
 
 # --------------------------------------------------------------- arbitrary-angle rotate, all modes
