@@ -88,6 +88,7 @@ RESAMPLE_CHOICES: Dict[str, str] = {
 }
 
 _EXIF_ORIENTATION = 0x0112
+_ROTATING_ORIENTATIONS = (5, 6, 7, 8)   # the tags that swap the axes when a reader applies them
 _EXIF_MAKE = 0x010F
 _EXIF_MODEL = 0x0110
 _EXIF_DATETIME = 0x0132
@@ -424,10 +425,12 @@ def _verify_encoded(tmp: Path, expect: Optional[Dict[str, Any]]) -> None:
     """Re-read the encoded temp file before publishing it: size, frame count, decodability."""
     if not expect:
         return
+    read_orientation = None
     try:
         with Image.open(tmp) as check:
             size = (int(check.size[0]), int(check.size[1]))
             frames = max(1, int(getattr(check, "n_frames", 1) or 1))
+            read_orientation = check.getexif().get(_EXIF_ORIENTATION)
             check.load()
             icc_bytes = len(check.info.get("icc_profile") or b"")
             exif_present = bool(len(check.getexif()))
@@ -437,10 +440,17 @@ def _verify_encoded(tmp: Path, expect: Optional[Dict[str, Any]]) -> None:
             "this is a plugin bug, not your input — try another target format and report it",
         )
     want_size = expect.get("size")
-    if want_size is not None and size != (int(want_size[0]), int(want_size[1])):
-        raise ToolError(
-            f"the encoder wrote {size[0]}x{size[1]} but the tool reported "
-            f"{int(want_size[0])}x{int(want_size[1])}; nothing was written",
+    if want_size is not None:
+        want = (int(want_size[0]), int(want_size[1]))
+        # Pillow's TIFF reader applies a rotating EXIF orientation (5-8) as it opens the file and
+        # consumes the tag at load, so a TIFF written with such a tag reads back transposed — which
+        # is the file being right, not wrong. Only that declared case is allowed through: an encoder
+        # that merely swapped the two dimensions still fails here.
+        transposed_by_tag = size == (want[1], want[0]) and read_orientation in _ROTATING_ORIENTATIONS
+        if size != want and not transposed_by_tag:
+            raise ToolError(
+                f"the encoder wrote {size[0]}x{size[1]} but the tool reported "
+                f"{want[0]}x{want[1]}; nothing was written",
                 "this is a plugin bug, not your input — try another target format and report it",
             )
     want_frames = expect.get("frames")

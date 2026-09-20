@@ -390,6 +390,43 @@ def test_the_output_mode_is_applied_after_the_publish(tmp_path, monkeypatch):
     real_chmod(src, 0o644)
 
 
+def test_convert_to_tiff_accepts_the_orientation_its_reader_applies(tmp_path):
+    """A TIFF written with a rotating EXIF orientation reads back transposed — and that is correct.
+
+    Pillow's TIFF reader applies orientation 5-8 as it opens the file and consumes the tag at load,
+    so the encoded file is legitimately transposed relative to the in-memory image. The write used
+    to fail its own verification instead: "the encoder wrote 60x80 but the tool reported 80x60".
+    """
+    src = tmp_path / "photo.jpg"
+    exif = Image.Exif()
+    exif[274] = 6
+    Image.new("RGB", (80, 60), (120, 60, 30)).save(src, quality=90, exif=exif.tobytes())
+
+    env = load(tools.image_convert(path=str(src), format="TIFF", output_path=str(tmp_path / "out.tif")))
+    assert "error" not in env, env
+    assert Path(env["output"]).exists(), "nothing was written"
+    with Image.open(env["output"]) as check:
+        assert check.size == (60, 80), "the TIFF should read back transposed by its own tag"
+
+
+def test_verify_encoded_rejects_a_transposed_size_without_a_rotating_tag(tmp_path):
+    """The relaxation above is not a blanket "either orientation is fine"."""
+    path = tmp_path / "still.png"
+    Image.new("RGB", (10, 20), (5, 5, 5)).save(path)
+    with pytest.raises(tools.ToolError, match="the encoder wrote 10x20"):
+        tools._verify_encoded(path, {"size": (20, 10)})
+
+
+def test_verify_encoded_accepts_a_transposed_size_when_the_file_declares_the_rotation(tmp_path):
+    path = tmp_path / "rot.tif"
+    exif = Image.Exif()
+    exif[274] = 6
+    Image.new("RGB", (10, 20), (5, 5, 5)).save(path, format="TIFF", exif=exif.tobytes())
+    with Image.open(path) as back:
+        assert back.size == (20, 10)          # the reader applied the tag
+    tools._verify_encoded(path, {"size": (10, 20)})   # must not raise
+
+
 def test_the_publish_runs_while_the_guard_lock_is_held(tmp_path, monkeypatch):
     """Release -> rename -> chmod is one critical section; a worker thread must not slip inside it.
 
