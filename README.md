@@ -1,9 +1,7 @@
 # Hermes `image-utils` plugin
 
-## AI-generated code
-
-The code in this repository was written with AI assistance, then reviewed and tested before
-publication.
+**AI-generated code** — The code in this repository was written with AI assistance, then reviewed and
+tested before publication.
 
 Local image-file tools for Hermes Agent: inspect, resize, crop, rotate, convert and re-encode photos
 without a shell. Pillow (12.3.0, already in the Hermes venv) runs in-process — no `subprocess`, no
